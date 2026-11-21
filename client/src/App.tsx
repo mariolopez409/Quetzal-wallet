@@ -6,15 +6,7 @@ import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
 import { api, type ApiResponse } from "./api";
 import { getSessionToken, setSessionToken, clearSessionToken } from "./session";
 import type { Actions } from "../../server/src/actions";
-import gtqLogo from "./assets/coins/gtq.jpg";
-import usdtLogo from "./assets/coins/usdt.png";
-import usdcLogo from "./assets/coins/usdc.png";
-import solLogo from "./assets/coins/sol.png";
-import ethLogo from "./assets/coins/eth.png";
-import bnbLogo from "./assets/coins/bnb.png";
-import polLogo from "./assets/coins/pol.png";
-import avaxLogo from "./assets/coins/avax.png";
-import trxLogo from "./assets/coins/trx.png";
+import { COIN_LOGOS } from "./coin-logos";
 
 const FIELDS = actionFields<typeof Actions>();
 
@@ -51,10 +43,6 @@ function ledgerOf(user: CustUser | null, network: string, asset: string): string
 // Home shows ONE row per coin: USDT and USDC appear once with their TOTAL
 // balance summed across every network. The network is chosen only inside
 // the coin detail, when sending or receiving.
-const COIN_LOGOS: Record<string, string> = {
-  GTQ: gtqLogo, USDT: usdtLogo, USDC: usdcLogo, SOL: solLogo, ETH: ethLogo,
-  BNB: bnbLogo, POL: polLogo, AVAX: avaxLogo, TRX: trxLogo,
-};
 const COIN_NAMES: Record<string, string> = {
   GTQ: "Quetzal", USDT: "Tether", USDC: "USD Coin", SOL: "Solana",
   ETH: "Ethereum", BNB: "BNB", POL: "Polygon", AVAX: "Avalanche", TRX: "Tron",

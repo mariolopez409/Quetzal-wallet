@@ -322,6 +322,69 @@ async function buildUser(db: Db, u: typeof schema.custodialUsers.$inferSelect) {
   };
 }
 
+// ---------------- Password auth, sessions, recovery (migration 0008) ------
+// Production access control. Every account has a password stored as a scrypt
+// hash + per-user salt (never plaintext). Login issues a session token; only
+// its SHA-256 hash is stored, it expires in 30 days, and logout deletes it.
+// The first registered account (account_index 0) is the operator: only the
+// operator can credit balances manually, save the Crossmint API key, change
+// the service fee, verify KYC or list every user. Money-moving actions
+// require a valid session and act only on the session user's own account.
+// Failed logins are rate-limited per email (10 per 15 minutes). Recovery
+// codes are 6 digits, stored only as a scrypt hash, valid 30 minutes,
+// single-use, with at most 5 attempts; requesting a new one voids the old.
+
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const RECOVERY_TTL_MS = 30 * 60 * 1000;
+const RECOVERY_MAX_ATTEMPTS = 5;
+const LOGIN_MAX_ATTEMPTS = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const SESSION_ERROR = "Tu sesión no es válida o ya venció. Inicia sesión de nuevo.";
+
+type UserRow = typeof schema.custodialUsers.$inferSelect;
+
+async function createSession(ctx: Ctx, userId: number): Promise<string> {
+  const db = ctx.db<typeof schema>();
+  const { token } = await ctx.executePrivileged(privileged.generateSessionToken, {});
+  const { hash } = await ctx.executePrivileged(privileged.hashToken, { token });
+  await db.insert(schema.userSessions).values({
+    userId, tokenHash: hash, expiresAt: Date.now() + SESSION_TTL_MS,
+  });
+  return token;
+}
+
+async function requireSession(ctx: Ctx, token: string): Promise<UserRow> {
+  const db = ctx.db<typeof schema>();
+  if (!token) throw new Error(SESSION_ERROR);
+  const { hash } = await ctx.executePrivileged(privileged.hashToken, { token });
+  const rows = await db.select().from(schema.userSessions)
+    .where(eq(schema.userSessions.tokenHash, hash));
+  const session = rows[0];
+  if (!session || session.expiresAt < Date.now()) {
+    if (session) await db.delete(schema.userSessions).where(eq(schema.userSessions.id, session.id));
+    throw new Error(SESSION_ERROR);
+  }
+  const user = await getUserRow(db, session.userId);
+  if (!user) throw new Error(SESSION_ERROR);
+  return user;
+}
+
+async function requireSelfOrOperator(ctx: Ctx, token: string, userId: number): Promise<UserRow> {
+  const me = await requireSession(ctx, token);
+  if (me.id !== userId && me.accountIndex !== 0) {
+    throw new Error("No tienes permiso para operar la cuenta de otro usuario.");
+  }
+  return me;
+}
+
+async function requireOperator(ctx: Ctx, token: string): Promise<UserRow> {
+  const me = await requireSession(ctx, token);
+  if (me.accountIndex !== 0) {
+    throw new Error("Esta acción es solo para el operador de la wallet.");
+  }
+  return me;
+}
+
 // ---------------- KYC, limits, gas and swap-fee policy ----------------
 // Verbatim product rules from the operator (2026-11-19): KYC is requested by
 // email to gt.guatemala.com@gmail.com, and ONLY that email has authority to
@@ -382,7 +445,7 @@ const CROSSMINT_SERVER_SIGNER = "84Vx1DJx8RGJizV7gKxLZRcPGTiVofi7Pvn7cjcqTQvy";
 // rows were encrypted with the old vault passphrase and are undecryptable
 // now that the seed vault is gone: the operator saves the key once more.
 const CROSSMINT_KEY_VERSION = 2;
-const LEGACY_KEY_ERROR = "La API key de Crossmint guardada es de la versión anterior (se cifraba con la contraseña de la bóveda, que ya no existe). Vuelve a guardarla en Perfil → Crossmint: ahora solo se pega la API key, sin contraseña ni frase semilla.";
+const LEGACY_KEY_ERROR = "La API key de Crossmint guardada es de la versión anterior y ya no se puede leer. El operador debe volver a guardarla: ahora solo se pega la API key, sin contraseña ni frase semilla.";
 
 type CrossmintRow = typeof schema.crossmintSettings.$inferSelect;
 
@@ -480,7 +543,7 @@ async function assertGasBalance(db: Db, userId: number, networkId: string, price
 
 // ---------------- Automatic deposit sync (NC Wallet style) ----------------
 // Reads live on-chain balances at one user's addresses and credits the
-// internal ledger with any increase since the last sync. Used by the manual
+// ledger with any increase since the last sync. Used by the manual
 // syncUserDeposits action AND by syncAllDeposits, which the artifact runs on
 // a schedule so deposits are credited automatically — no manual step.
 
@@ -569,10 +632,12 @@ export const Actions = {
   }),
 
   getWallet: defineAction({
-    description: "Returns the saved Quetzal wallet profile and its per-network addresses, or null if none exists yet.",
-    request: z.object({}),
+    description: "Returns the saved Quetzal wallet profile and its per-network addresses, or null if none exists yet. Requires a valid session.",
+    request: z.object({ sessionToken: z.string().max(200) }),
     response: walletResponse,
-    async handler(ctx): Promise<WalletResponse> {
+    privileged: [privileged.hashToken],
+    async handler(ctx, args): Promise<WalletResponse> {
+      await requireSession(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.wallets).orderBy(asc(schema.wallets.id)).limit(1);
       const w = rows[0];
@@ -588,8 +653,10 @@ export const Actions = {
   }),
 
   saveWallet: defineAction({
-    description: "Creates or updates the Quetzal wallet profile: label, GTQ service fee, and one public address per network.",
+    description: "Creates or updates the Quetzal wallet profile: label, GTQ service fee, and one public address per network. Operator only.",
+    privileged: [privileged.hashToken],
     request: z.object({
+      sessionToken: z.string().max(200),
       label: z.string().trim().min(1).max(60),
       feeGtq: z.string().trim().min(1).max(12),
       addresses: z.array(z.object({
@@ -599,6 +666,7 @@ export const Actions = {
     }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      await requireOperator(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const fee = Number(args.feeGtq);
       if (!Number.isFinite(fee) || fee < 0) throw new Error("La comisión en GTQ no es válida.");
@@ -639,8 +707,9 @@ export const Actions = {
   }),
 
   getBalances: defineAction({
-    description: "Reads live on-chain balances for every registered address across all networks, GTQ first, with USD reference prices where a market exists.",
-    request: z.object({}),
+    description: "Reads live on-chain balances for every registered address across all networks, GTQ first, with USD reference prices where a market exists. Requires a valid session.",
+    request: z.object({ sessionToken: z.string().max(200) }),
+    privileged: [privileged.hashToken],
     response: z.object({
       assets: z.array(z.object({
         network: z.string(), networkName: z.string(), asset: z.string(),
@@ -650,7 +719,8 @@ export const Actions = {
       totalUsd: z.number().nullable(),
       fetchedAt: z.string(),
     }),
-    async handler(ctx) {
+    async handler(ctx, args) {
+      await requireSession(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.wallets).orderBy(asc(schema.wallets.id)).limit(1);
       const w = rows[0];
@@ -699,8 +769,10 @@ export const Actions = {
   }),
 
   recordTransaction: defineAction({
-    description: "Records a send or swap the user reviewed and confirmed (signed) in the Quetzal Wallet, including the GTQ service fee and its payment payload.",
+    description: "Records a send or swap the user reviewed and confirmed (signed) in the Quetzal Wallet, including the GTQ service fee and its payment payload. Requires a valid session.",
+    privileged: [privileged.hashToken],
     request: z.object({
+      sessionToken: z.string().max(200),
       kind: z.enum(["send", "swap"]),
       network: z.string().min(1).max(24),
       fromAsset: z.string().min(1).max(10),
@@ -713,6 +785,7 @@ export const Actions = {
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
+      await requireSession(ctx, args.sessionToken);
       const amount = Number(args.amount);
       if (!Number.isFinite(amount) || amount <= 0) throw new Error("La cantidad no es válida.");
       const db = ctx.db<typeof schema>();
@@ -729,13 +802,16 @@ export const Actions = {
   }),
 
   listTransactions: defineAction({
-    description: "Lists the wallet's recorded sends and swaps, newest first.",
-    request: z.object({ limit: z.number().int().positive().max(100).default(50) }),
+    description: "Lists recorded sends and swaps, newest first. Requires a session: regular users only see their own operations; the operator sees all.",
+    request: z.object({ limit: z.number().int().positive().max(100).default(50), sessionToken: z.string().max(200) }),
+    privileged: [privileged.hashToken],
     response: z.object({ transactions: z.array(txShape) }),
     async handler(ctx, args) {
+      const me = await requireSession(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
-      const rows = await db.select().from(schema.transactions)
-        .orderBy(desc(schema.transactions.id)).limit(args.limit);
+      const all = await db.select().from(schema.transactions)
+        .orderBy(desc(schema.transactions.id)).limit(500);
+      const rows = (me.accountIndex === 0 ? all : all.filter((r) => r.userId === me.id)).slice(0, args.limit);
       return {
         transactions: rows.map((r) => ({
           id: r.id, kind: r.kind, network: r.network, fromAsset: r.fromAsset,
@@ -749,14 +825,16 @@ export const Actions = {
   }),
 
   listContacts: defineAction({
-    description: "Lists saved recipient contacts for sends.",
-    request: z.object({}),
+    description: "Lists saved recipient contacts for sends. Requires a valid session.",
+    request: z.object({ sessionToken: z.string().max(200) }),
+    privileged: [privileged.hashToken],
     response: z.object({
       contacts: z.array(z.object({
         id: z.number(), name: z.string(), network: z.string(), address: z.string(),
       })),
     }),
-    async handler(ctx) {
+    async handler(ctx, args) {
+      await requireSession(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.contacts).orderBy(asc(schema.contacts.name));
       return { contacts: rows.map((r) => ({ id: r.id, name: r.name, network: r.network, address: r.address })) };
@@ -766,14 +844,18 @@ export const Actions = {
   addContact: defineAction({
     description: "Saves a recipient contact with a name, network, and address.",
     request: z.object({
+      sessionToken: z.string().max(200),
       name: z.string().trim().min(1).max(60),
       network: z.string().min(1).max(24),
       address: z.string().trim().min(8).max(120),
     }),
+    privileged: [privileged.hashToken],
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
+      await requireSession(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
-      const inserted = await db.insert(schema.contacts).values(args).returning({ id: schema.contacts.id });
+      const { sessionToken: _tok, ...contact } = args;
+      const inserted = await db.insert(schema.contacts).values(contact).returning({ id: schema.contacts.id });
       const row = inserted[0];
       if (!row) throw new Error("No se pudo guardar el contacto.");
       ctx.invalidateQueries();
@@ -783,9 +865,11 @@ export const Actions = {
 
   deleteContact: defineAction({
     description: "Deletes one saved recipient contact by id.",
-    request: z.object({ id: z.number().int().positive() }),
+    request: z.object({ id: z.number().int().positive(), sessionToken: z.string().max(200) }),
     response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.hashToken],
     async handler(ctx, args): Promise<{ ok: true }> {
+      await requireSession(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       await db.delete(schema.contacts).where(eq(schema.contacts.id, args.id));
       ctx.invalidateQueries();
@@ -805,10 +889,12 @@ export const Actions = {
   }),
 
   updateAppSettings: defineAction({
-    description: "Updates the fixed GTQ service fee charged per send and internal transfer.",
-    request: z.object({ feeGtq: z.string().trim().min(1).max(12) }),
+    description: "Updates the fixed GTQ service fee charged per send and transfer between users. Operator only.",
+    request: z.object({ feeGtq: z.string().trim().min(1).max(12), sessionToken: z.string().max(200) }),
+    privileged: [privileged.hashToken],
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      await requireOperator(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const fee = Number(args.feeGtq);
       if (!Number.isFinite(fee) || fee < 0) throw new Error("La comisión en GTQ no es válida.");
@@ -825,10 +911,12 @@ export const Actions = {
   }),
 
   listUsers: defineAction({
-    description: "Lists all custodial users with their deposit addresses (Crossmint wallet on Solana; legacy users keep the addresses they already had) and their internal ledger balances.",
-    request: z.object({}),
+    description: "Lists all custodial users with their deposit addresses (Crossmint wallet on Solana; legacy users keep the addresses they already had) and their ledger balances. Operator only: requires the operator's session.",
+    request: z.object({ sessionToken: z.string().max(200) }),
+    privileged: [privileged.hashToken],
     response: z.object({ users: z.array(userShape) }),
-    async handler(ctx) {
+    async handler(ctx, args) {
+      await requireOperator(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.custodialUsers).orderBy(asc(schema.custodialUsers.accountIndex));
       const users = [];
@@ -838,12 +926,14 @@ export const Actions = {
   }),
 
   createUser: defineAction({
-    description: "Registers a user with their email (permanent binding: the email can never be changed or reused, and the wallet stays linked to it forever) and automatically creates their Crossmint Solana Smart Wallet (server signer) with the operator's saved API key — no seed phrase, no passphrase. The Crossmint address is also stored as the user's Solana address so balances, deposit sync and the gas check use it. A Crossmint failure never loses the registration; it is returned so the wallet can be created later from the Crossmint panel.",
+    description: "Registers a user with their email and password (permanent binding: the email can never be changed or reused, and the wallet stays linked to it forever). The password is stored only as a scrypt hash. Automatically creates their Crossmint Solana Smart Wallet (server signer) with the operator's saved API key — no seed phrase. The Crossmint address is also stored as the user's Solana address so balances, deposit sync and the gas check use it. A Crossmint failure never loses the registration; it is returned so the operator can create the wallet later. Returns a session token so the new user is signed in.",
     request: z.object({
       name: z.string().trim().min(1).max(60),
       email: z.string().trim().min(3).max(120),
+      password: z.string().min(8).max(72),
     }),
-    response: z.object({ user: userShape, crossmintError: z.string().nullable() }),
+    response: z.object({ user: userShape, crossmintError: z.string().nullable(), sessionToken: z.string() }),
+    privileged: [privileged.hashSecret, privileged.generateSessionToken, privileged.hashToken, privileged.decryptText, privileged.generateServerSecret],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const email = args.email.trim().toLowerCase();
@@ -853,8 +943,9 @@ export const Actions = {
         throw new Error("Ese correo ya está registrado y ligado permanentemente a la wallet de su cuenta. Inicia sesión con ese correo en lugar de crear otra cuenta.");
       }
       const nextIndex = existing.length === 0 ? 0 : Math.max(...existing.map((u) => u.accountIndex)) + 1;
+      const pw = await ctx.executePrivileged(privileged.hashSecret, { secret: args.password });
       const inserted = await db.insert(schema.custodialUsers)
-        .values({ name: args.name, email, accountIndex: nextIndex })
+        .values({ name: args.name, email, accountIndex: nextIndex, passwordHash: pw.hash, passwordSalt: pw.salt })
         .returning();
       const user = inserted[0];
       if (!user) throw new Error("No se pudo crear el usuario.");
@@ -885,28 +976,216 @@ export const Actions = {
           crossmintError = e instanceof Error ? e.message : "No se pudo crear la wallet de Crossmint.";
         }
       }
+      const sessionToken = await createSession(ctx, user.id);
       ctx.invalidateQueries();
-      return { user: await buildUser(db, user), crossmintError };
+      return { user: await buildUser(db, user), crossmintError, sessionToken };
     },
   }),
 
-  findUserByEmail: defineAction({
-    description: "Email login: finds the account permanently bound to an email address and returns it with its addresses and ledger balances, or null if no account is registered with that email.",
-    request: z.object({ email: z.string().trim().min(3).max(120) }),
-    response: z.object({ user: userShape.nullable() }),
+  login: defineAction({
+    description: "Signs a user in with their email and password. The error is always the same whether the email or the password is wrong, and failed attempts are rate-limited per email. Returns the user and a session token (only its hash is stored server-side). Accounts created before passwords existed have no password and must set one through the recovery flow first.",
+    request: z.object({
+      email: z.string().trim().min(3).max(120),
+      password: z.string().min(1).max(72),
+    }),
+    response: z.object({ user: userShape, sessionToken: z.string() }),
+    privileged: [privileged.verifySecret, privileged.generateSessionToken, privileged.hashToken],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const email = args.email.trim().toLowerCase();
+      const since = Date.now() - LOGIN_WINDOW_MS;
+      const attempts = await db.select().from(schema.loginAttempts)
+        .where(eq(schema.loginAttempts.email, email));
+      if (attempts.filter((a) => a.createdAt.getTime() > since).length >= LOGIN_MAX_ATTEMPTS) {
+        throw new Error("Demasiados intentos fallidos. Espera 15 minutos e inténtalo de nuevo.");
+      }
+      const fail = async (): Promise<never> => {
+        await db.insert(schema.loginAttempts).values({ email });
+        throw new Error("Correo o contraseña incorrectos.");
+      };
       const rows = await db.select().from(schema.custodialUsers);
-      const found = rows.find((u) => u.email.toLowerCase() === email);
-      if (!found) return { user: null };
-      return { user: await buildUser(db, found) };
+      const user = rows.find((u) => u.email.toLowerCase() === email);
+      if (!user) return fail();
+      if (!user.passwordHash) {
+        throw new Error("Esta cuenta aún no tiene contraseña. Toca «Olvidé mi contraseña» para crear una con el código que te enviaremos por correo.");
+      }
+      const ok = await ctx.executePrivileged(privileged.verifySecret, {
+        secret: args.password, hash: user.passwordHash, salt: user.passwordSalt,
+      });
+      if (!ok.ok) return fail();
+      await db.delete(schema.loginAttempts).where(eq(schema.loginAttempts.email, email));
+      const sessionToken = await createSession(ctx, user.id);
+      ctx.invalidateQueries();
+      return { user: await buildUser(db, user), sessionToken };
+    },
+  }),
+
+  logout: defineAction({
+    description: "Signs the session user out: deletes the session so its token can never be used again.",
+    request: z.object({ sessionToken: z.string().max(200) }),
+    response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.hashToken],
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      if (args.sessionToken) {
+        const { hash } = await ctx.executePrivileged(privileged.hashToken, { token: args.sessionToken });
+        await db.delete(schema.userSessions).where(eq(schema.userSessions.tokenHash, hash));
+      }
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  getSessionUser: defineAction({
+    description: "Returns the user bound to a session token, or null when the token is unknown or expired. Used by the app to restore the signed-in session on open.",
+    request: z.object({ sessionToken: z.string().max(200) }),
+    response: z.object({ user: userShape.nullable() }),
+    privileged: [privileged.hashToken],
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      try {
+        const user = await requireSession(ctx, args.sessionToken);
+        return { user: await buildUser(db, user) };
+      } catch {
+        return { user: null };
+      }
+    },
+  }),
+
+  requestPasswordRecovery: defineAction({
+    description: "Starts password recovery for an email: generates a 6-digit code (only its scrypt hash is stored; 30-minute expiry, single use, max 5 attempts; a new request voids the previous code) and asks the operator's agent to email the code to the account's own email address. The response is always the same generic success so it never reveals whether an email is registered.",
+    request: z.object({ email: z.string().trim().min(3).max(120) }),
+    response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.generateRecoveryCode, privileged.hashSecret],
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      const email = args.email.trim().toLowerCase();
+      const rows = await db.select().from(schema.custodialUsers);
+      const user = rows.find((u) => u.email.toLowerCase() === email);
+      if (user) {
+        await db.update(schema.passwordRecovery).set({ used: 1 })
+          .where(eq(schema.passwordRecovery.userId, user.id));
+        const { code } = await ctx.executePrivileged(privileged.generateRecoveryCode, {});
+        const hashed = await ctx.executePrivileged(privileged.hashSecret, { secret: code });
+        await db.insert(schema.passwordRecovery).values({
+          userId: user.id, codeHash: hashed.hash, codeSalt: hashed.salt,
+          expiresAt: Date.now() + RECOVERY_TTL_MS, attempts: 0, used: 0,
+        });
+        try {
+          await ctx.agent.spawnTask(
+            `Envía un correo de recuperación de contraseña de la Quetzal Wallet. Destinatario: ${user.email} (es el correo de la cuenta del propio usuario). Asunto: "Código de recuperación — Quetzal Wallet". Cuerpo: un mensaje breve y claro en español indicando que su código de recuperación es ${code}, que vence en 30 minutos, que es de un solo uso, y que si no pidió este código ignore el correo. Envíalo con la cuenta de Gmail conectada del operador. En tu respuesta en el chat NO repitas el código: confirma únicamente que el correo fue enviado.`,
+            { dedupeKey: `qw-recovery-${user.id}` },
+          );
+        } catch {
+          // Delivery is best-effort from the action: the code exists and is
+          // valid regardless; the generic response must not leak state.
+        }
+      }
+      return { ok: true as const };
+    },
+  }),
+
+  resetPassword: defineAction({
+    description: "Sets a new password using the 6-digit recovery code sent to the account's email. Wrong, expired or reused codes all fail with the same message; after a successful reset every existing session of the user is closed.",
+    request: z.object({
+      email: z.string().trim().min(3).max(120),
+      code: z.string().trim().length(6),
+      newPassword: z.string().min(8).max(72),
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.verifySecret, privileged.hashSecret],
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      const email = args.email.trim().toLowerCase();
+      const generic = "El código no es válido o ya venció. Pide un código nuevo.";
+      const rows = await db.select().from(schema.custodialUsers);
+      const user = rows.find((u) => u.email.toLowerCase() === email);
+      if (!user) throw new Error(generic);
+      const recs = await db.select().from(schema.passwordRecovery)
+        .where(eq(schema.passwordRecovery.userId, user.id))
+        .orderBy(desc(schema.passwordRecovery.id));
+      const rec = recs.find((r) => r.used === 0);
+      if (!rec || rec.expiresAt < Date.now()) throw new Error(generic);
+      if (rec.attempts >= RECOVERY_MAX_ATTEMPTS) {
+        throw new Error("Demasiados intentos con este código. Pide un código nuevo.");
+      }
+      const ok = await ctx.executePrivileged(privileged.verifySecret, {
+        secret: args.code, hash: rec.codeHash, salt: rec.codeSalt,
+      });
+      if (!ok.ok) {
+        await db.update(schema.passwordRecovery).set({ attempts: rec.attempts + 1 })
+          .where(eq(schema.passwordRecovery.id, rec.id));
+        throw new Error(generic);
+      }
+      const pw = await ctx.executePrivileged(privileged.hashSecret, { secret: args.newPassword });
+      await db.update(schema.custodialUsers)
+        .set({ passwordHash: pw.hash, passwordSalt: pw.salt })
+        .where(eq(schema.custodialUsers.id, user.id));
+      await db.update(schema.passwordRecovery).set({ used: 1 })
+        .where(eq(schema.passwordRecovery.id, rec.id));
+      await db.delete(schema.userSessions).where(eq(schema.userSessions.userId, user.id));
+      await db.delete(schema.loginAttempts).where(eq(schema.loginAttempts.email, email));
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  changePassword: defineAction({
+    description: "Changes the signed-in user's password after verifying the current one, and closes their other sessions.",
+    request: z.object({
+      sessionToken: z.string().max(200),
+      currentPassword: z.string().min(1).max(72),
+      newPassword: z.string().min(8).max(72),
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.hashToken, privileged.verifySecret, privileged.hashSecret],
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      const me = await requireSession(ctx, args.sessionToken);
+      if (!me.passwordHash) {
+        throw new Error("Esta cuenta aún no tiene contraseña. Usa «Olvidé mi contraseña» en la pantalla de acceso para crear una.");
+      }
+      const ok = await ctx.executePrivileged(privileged.verifySecret, {
+        secret: args.currentPassword, hash: me.passwordHash, salt: me.passwordSalt,
+      });
+      if (!ok.ok) throw new Error("La contraseña actual no es correcta.");
+      const pw = await ctx.executePrivileged(privileged.hashSecret, { secret: args.newPassword });
+      await db.update(schema.custodialUsers)
+        .set({ passwordHash: pw.hash, passwordSalt: pw.salt })
+        .where(eq(schema.custodialUsers.id, me.id));
+      const { hash } = await ctx.executePrivileged(privileged.hashToken, { token: args.sessionToken });
+      const sessions = await db.select().from(schema.userSessions)
+        .where(eq(schema.userSessions.userId, me.id));
+      for (const s of sessions) {
+        if (s.tokenHash !== hash) {
+          await db.delete(schema.userSessions).where(eq(schema.userSessions.id, s.id));
+        }
+      }
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  listTransferRecipients: defineAction({
+    description: "Lists the minimal directory (id, name, email) of registered users so a signed-in user can pick a recipient for a transfer between users. Requires a valid session.",
+    request: z.object({ sessionToken: z.string().max(200) }),
+    response: z.object({
+      recipients: z.array(z.object({ id: z.number(), name: z.string(), email: z.string() })),
+    }),
+    privileged: [privileged.hashToken],
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      await requireSession(ctx, args.sessionToken);
+      const rows = await db.select().from(schema.custodialUsers)
+        .orderBy(asc(schema.custodialUsers.accountIndex));
+      return { recipients: rows.map((u) => ({ id: u.id, name: u.name, email: u.email })) };
     },
   }),
 
   getUserBalances: defineAction({
-    description: "Reads live on-chain balances for one user's addresses across all networks (their Crossmint wallet on Solana), GTQ first, with USD reference prices.",
-    request: z.object({ userId: z.number().int().positive() }),
+    description: "Reads live on-chain balances for one user's addresses across all networks (their Crossmint wallet on Solana), GTQ first, with USD reference prices. Requires a session for that user (or the operator).",
+    privileged: [privileged.hashToken],
+    request: z.object({ userId: z.number().int().positive(), sessionToken: z.string().max(200) }),
     response: z.object({
       assets: z.array(z.object({
         network: z.string(), networkName: z.string(), asset: z.string(),
@@ -917,6 +1196,7 @@ export const Actions = {
       fetchedAt: z.string(),
     }),
     async handler(ctx, args) {
+      await requireSelfOrOperator(ctx, args.sessionToken, args.userId);
       const db = ctx.db<typeof schema>();
       const userRow = await getUserRow(db, args.userId);
       const rawAddrs = await db.select().from(schema.userAddresses).where(eq(schema.userAddresses.userId, args.userId));
@@ -959,13 +1239,15 @@ export const Actions = {
   }),
 
   syncUserDeposits: defineAction({
-    description: "Syncs one user's deposits: reads live on-chain balances at their addresses and credits the internal ledger with any increase since the last sync.",
-    request: z.object({ userId: z.number().int().positive() }),
+    description: "Syncs one user's deposits: reads live on-chain balances at their addresses and credits the ledger with any increase since the last sync. Requires a session for that user (or the operator).",
+    privileged: [privileged.hashToken],
+    request: z.object({ userId: z.number().int().positive(), sessionToken: z.string().max(200) }),
     response: z.object({
       credited: z.array(z.object({ network: z.string(), asset: z.string(), amount: z.string() })),
       fetchedAt: z.string(),
     }),
     async handler(ctx, args) {
+      await requireSelfOrOperator(ctx, args.sessionToken, args.userId);
       const db = ctx.db<typeof schema>();
       const rawAddrs = await db.select().from(schema.userAddresses).where(eq(schema.userAddresses.userId, args.userId));
       if (rawAddrs.length === 0) throw new Error("Usuario sin direcciones.");
@@ -976,7 +1258,7 @@ export const Actions = {
   }),
 
   syncAllDeposits: defineAction({
-    description: "Automatic NC Wallet-style deposit sync for ALL custodial users: reads live on-chain balances at every user's addresses (Crossmint address on Solana when present) and credits each internal ledger with any new deposit. Runs on a schedule and when the app opens; no manual step.",
+    description: "Automatic NC Wallet-style deposit sync for ALL custodial users: reads live on-chain balances at every user's addresses (Crossmint address on Solana when present) and credits each ledger with any new deposit. Runs on a schedule and when the app opens; no manual step.",
     request: z.object({}),
     response: z.object({
       usersChecked: z.number(),
@@ -999,8 +1281,9 @@ export const Actions = {
   }),
 
   creditDeposit: defineAction({
-    description: "Manually credits a deposit to a custodial user's internal ledger balance (operator-confirmed deposit).",
+    description: "Manually credits a deposit to a custodial user's ledger balance (operator-confirmed deposit). Operator only: a regular user can never credit their own balance.",
     request: z.object({
+      sessionToken: z.string().max(200),
       userId: z.number().int().positive(),
       network: z.string().min(1).max(24),
       asset: z.string().min(1).max(10),
@@ -1008,7 +1291,9 @@ export const Actions = {
       note: z.string().trim().max(140),
     }),
     response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.hashToken],
     async handler(ctx, args): Promise<{ ok: true }> {
+      await requireOperator(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const amount = Number(args.amount);
       if (!Number.isFinite(amount) || amount <= 0) throw new Error("La cantidad no es válida.");
@@ -1043,8 +1328,9 @@ export const Actions = {
   }),
 
   internalTransfer: defineAction({
-    description: "Instant internal transfer between two custodial users on the same network/asset, settled only on the internal ledger. Charges the app GTQ service fee to the sender (in GTQ, on Solana ledger).",
+    description: "Instant internal transfer between two custodial users on the same network/asset, settled only on the ledger. Charges the app GTQ service fee to the sender (in GTQ, on Solana ledger).",
     request: z.object({
+      sessionToken: z.string().max(200),
       fromUserId: z.number().int().positive(),
       toUserId: z.number().int().positive(),
       network: z.string().min(1).max(24),
@@ -1053,7 +1339,10 @@ export const Actions = {
       note: z.string().trim().max(140),
     }),
     response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.hashToken],
     async handler(ctx, args): Promise<{ ok: true }> {
+      const me = await requireSession(ctx, args.sessionToken);
+      if (me.id !== args.fromUserId) throw new Error("Solo puedes enviar desde tu propia cuenta.");
       const db = ctx.db<typeof schema>();
       if (args.fromUserId === args.toUserId) throw new Error("Elige dos usuarios distintos.");
       const amount = Number(args.amount);
@@ -1061,7 +1350,7 @@ export const Actions = {
       const feeGtq = await getFeeGtq(ctx);
       const fee = Number(feeGtq) || 0;
       const fromBal = await ledgerBalance(db, args.fromUserId, args.network, args.asset);
-      if (fromBal < amount) throw new Error(`Saldo interno insuficiente: el remitente tiene ${numStr(fromBal)} ${args.asset} en ${args.network}.`);
+      if (fromBal < amount) throw new Error(`Saldo insuficiente: el remitente tiene ${numStr(fromBal)} ${args.asset} en ${args.network}.`);
       if (fee > 0 && args.asset !== "GTQ") {
         const gtqBal = await ledgerBalance(db, args.fromUserId, "solana", "GTQ");
         if (gtqBal < fee) throw new Error(`El remitente necesita ${feeGtq} GTQ para la comisión y tiene ${numStr(gtqBal)} GTQ.`);
@@ -1098,8 +1387,9 @@ export const Actions = {
   }),
 
   recordUserTransaction: defineAction({
-    description: "Records a send or swap for a specific custodial user, debiting their internal ledger balance plus the GTQ service fee.",
+    description: "Records a send or swap for a specific custodial user, debiting their ledger balance plus the GTQ service fee.",
     request: z.object({
+      sessionToken: z.string().max(200),
       userId: z.number().int().positive(),
       kind: z.enum(["send", "swap"]),
       network: z.string().min(1).max(24),
@@ -1112,7 +1402,10 @@ export const Actions = {
       receiveAmount: z.string().trim().max(24),
     }),
     response: z.object({ id: z.number() }),
+    privileged: [privileged.hashToken],
     async handler(ctx, args) {
+      const me = await requireSession(ctx, args.sessionToken);
+      if (me.id !== args.userId) throw new Error("Solo puedes operar tu propia cuenta.");
       const db = ctx.db<typeof schema>();
       const amount = Number(args.amount);
       if (!Number.isFinite(amount) || amount <= 0) throw new Error("La cantidad no es válida.");
@@ -1150,7 +1443,7 @@ export const Actions = {
       const feeStr = numStr(fee);
       const bal = await ledgerBalance(db, args.userId, args.network, args.fromAsset);
       if (bal < amount) {
-        throw new Error(`Saldo interno insuficiente: este usuario tiene ${numStr(bal)} ${args.fromAsset} en esta red. Sincroniza sus depósitos o acredita el depósito primero.`);
+        throw new Error(`Saldo insuficiente: este usuario tiene ${numStr(bal)} ${args.fromAsset} en esta red. Sincroniza sus depósitos o acredita el depósito primero.`);
       }
       const isGtqSend = args.fromAsset === "GTQ" && args.network === "solana";
       if (fee > 0 && !isGtqSend) {
@@ -1192,8 +1485,9 @@ export const Actions = {
   }),
 
   listLedgerEntries: defineAction({
-    description: "Lists internal ledger entries (deposits, sends, swaps, internal transfers, fees) for one custodial user, newest first.",
-    request: z.object({ userId: z.number().int().positive(), limit: z.number().int().positive().max(100).default(50) }),
+    description: "Lists ledger entries (deposits, sends, swaps, transfers between users, fees) for one custodial user, newest first. Requires a session for that user (or the operator).",
+    privileged: [privileged.hashToken],
+    request: z.object({ userId: z.number().int().positive(), limit: z.number().int().positive().max(100).default(50), sessionToken: z.string().max(200) }),
     response: z.object({
       entries: z.array(z.object({
         id: z.number(), kind: z.string(), network: z.string(), asset: z.string(),
@@ -1202,6 +1496,7 @@ export const Actions = {
       })),
     }),
     async handler(ctx, args) {
+      await requireSelfOrOperator(ctx, args.sessionToken, args.userId);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.ledgerEntries)
         .where(eq(schema.ledgerEntries.userId, args.userId))
@@ -1217,13 +1512,16 @@ export const Actions = {
   }),
 
   updateUserProfile: defineAction({
-    description: "Updates a custodial user's phone number shown in their profile. The email is permanent and can never be changed.",
+    description: "Updates a custodial user's phone number shown in their profile. The email is permanent and can never be changed. Requires a session for that user (or the operator).",
+    privileged: [privileged.hashToken],
     request: z.object({
       userId: z.number().int().positive(),
       phone: z.string().trim().max(24),
+      sessionToken: z.string().max(200),
     }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      await requireSelfOrOperator(ctx, args.sessionToken, args.userId);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.custodialUsers)
         .where(eq(schema.custodialUsers.id, args.userId));
@@ -1237,9 +1535,11 @@ export const Actions = {
 
   requestKyc: defineAction({
     description: "Marks a custodial user's KYC as requested. The user asks for KYC by email to gt.guatemala.com@gmail.com; only that authority email can later grant the verified badge.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ userId: z.number().int().positive(), sessionToken: z.string().max(200) }),
     response: z.object({ ok: z.literal(true) }),
+    privileged: [privileged.hashToken],
     async handler(ctx, args): Promise<{ ok: true }> {
+      await requireSelfOrOperator(ctx, args.sessionToken, args.userId);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.custodialUsers)
         .where(eq(schema.custodialUsers.id, args.userId));
@@ -1255,13 +1555,16 @@ export const Actions = {
   }),
 
   setKycVerified: defineAction({
-    description: "Grants the KYC verified badge to a user. Only the authority email gt.guatemala.com@gmail.com may do this; any other authority email is rejected.",
+    description: "Grants the KYC verified badge to a user. Operator only, and only the authority email gt.guatemala.com@gmail.com may do this; any other authority email is rejected.",
+    privileged: [privileged.hashToken],
     request: z.object({
       userId: z.number().int().positive(),
       authorityEmail: z.string().trim().min(3).max(120),
+      sessionToken: z.string().max(200),
     }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      await requireOperator(ctx, args.sessionToken);
       if (args.authorityEmail.trim().toLowerCase() !== KYC_AUTHORITY_EMAIL) {
         throw new Error(`Solo ${KYC_AUTHORITY_EMAIL} tiene autoridad para dar la insignia de verificado. Ese correo no está autorizado.`);
       }
@@ -1277,8 +1580,9 @@ export const Actions = {
   }),
 
   getMonthlyUsage: defineAction({
-    description: "Returns a user's KYC status, their monthly deposit/withdrawal limit in GTQ (10,000 without KYC, 1,000,000 with KYC verified) and how much of each limit they have used this calendar month.",
-    request: z.object({ userId: z.number().int().positive() }),
+    description: "Returns a user's KYC status, their monthly deposit/withdrawal limit in GTQ (10,000 without KYC, 1,000,000 with KYC verified) and how much of each limit they have used this calendar month. Requires a session for that user (or the operator).",
+    privileged: [privileged.hashToken],
+    request: z.object({ userId: z.number().int().positive(), sessionToken: z.string().max(200) }),
     response: z.object({
       kycStatus: z.string(),
       limitGtq: z.number(),
@@ -1286,6 +1590,7 @@ export const Actions = {
       withdrawalsGtq: z.string(),
     }),
     async handler(ctx, args) {
+      await requireSelfOrOperator(ctx, args.sessionToken, args.userId);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.custodialUsers)
         .where(eq(schema.custodialUsers.id, args.userId));
@@ -1306,7 +1611,8 @@ export const Actions = {
 
   getCrossmintStatus: defineAction({
     description: "Returns whether a usable Crossmint server API key is saved (encrypted) in the app, whether the saved key is a legacy one that must be re-saved (it was encrypted with the removed vault passphrase), the server signer address used for user Smart Wallets, and how many users already have a Crossmint wallet. Never returns the key.",
-    request: z.object({}),
+    request: z.object({ sessionToken: z.string().max(200) }),
+    privileged: [privileged.hashToken],
     response: z.object({
       configured: z.boolean(),
       legacyKey: z.boolean(),
@@ -1315,7 +1621,8 @@ export const Actions = {
       usersTotal: z.number(),
       savedAt: z.string().nullable(),
     }),
-    async handler(ctx) {
+    async handler(ctx, args) {
+      await requireOperator(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const row = await getCrossmintRow(ctx);
       const users = await db.select().from(schema.custodialUsers);
@@ -1331,14 +1638,16 @@ export const Actions = {
   }),
 
   saveCrossmintKey: defineAction({
-    description: "Saves the operator's Crossmint server API key in the admin panel — the ONLY credential this wallet uses. It is verified against the Crossmint API before saving and stored encrypted at rest (scrypt + AES-256-GCM) under a server secret the app generates automatically: no seed phrase and no passphrase are asked. The plaintext is never stored in the clear or returned.",
+    description: "Saves the operator's Crossmint server API key — the ONLY credential this wallet uses. It is verified against the Crossmint API before saving and stored encrypted at rest (scrypt + AES-256-GCM) under a server secret the app generates automatically: no seed phrase and no passphrase are asked. The plaintext is never stored in the clear or returned.",
     request: z.object({
+      sessionToken: z.string().max(200),
       apiKey: z.string().trim().min(10).max(300),
       serverSignerAddress: z.string().trim().min(32).max(64).default(CROSSMINT_SERVER_SIGNER),
     }),
     response: z.object({ ok: z.literal(true) }),
-    privileged: [privileged.encryptText],
+    privileged: [privileged.encryptText, privileged.hashToken, privileged.generateServerSecret],
     async handler(ctx, args): Promise<{ ok: true }> {
+      await requireOperator(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       // Verify the key works before storing it: a wallet lookup for a
       // nonexistent locator must answer 404 (key + scopes valid), not 401/403.
@@ -1380,12 +1689,15 @@ export const Actions = {
     description: "Creates (or fetches, if it already exists) the Crossmint Solana Smart Wallet for one registered user with the saved API key and binds its address permanently to the user's email. Used to retry or to backfill users registered before the API key was saved. Also stores the address as the user's Solana address row when they have none.",
     request: z.object({
       userId: z.number().int().positive(),
+      sessionToken: z.string().max(200),
     }),
     response: z.object({ address: z.string() }),
+    privileged: [privileged.hashToken, privileged.decryptText, privileged.generateServerSecret],
     async handler(ctx, args) {
+      await requireOperator(ctx, args.sessionToken);
       const db = ctx.db<typeof schema>();
       const cmRow = await getCrossmintRow(ctx);
-      if (!cmRow) throw new Error("Primero guarda tu API key de Crossmint en el panel de administración.");
+      if (!cmRow) throw new Error("El operador aún no guarda su API key de Crossmint.");
       if (cmRow.keyVersion !== CROSSMINT_KEY_VERSION) throw new Error(LEGACY_KEY_ERROR);
       const user = await getUserRow(db, args.userId);
       if (!user) throw new Error("Usuario no encontrado.");

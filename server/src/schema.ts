@@ -89,6 +89,47 @@ export const custodialUsers = sqliteTable("custodial_users", {
   kycStatus: text("kyc_status").notNull().default("none"),
   accountIndex: integer("account_index").notNull(),
   crossmintAddress: text("crossmint_address").notNull().default(""),
+  // Password auth (migration 0008): scrypt hash + per-user salt. The
+  // plaintext password is never stored. Empty = account predates passwords
+  // and must set one through the recovery flow before it can log in.
+  passwordHash: text("password_hash").notNull().default(""),
+  passwordSalt: text("password_salt").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// ---------------- Sessions & password recovery (migration 0008) ----------------
+// Sessions: only the SHA-256 hash of the session token is stored, never the
+// token itself; 30-day expiry; logout deletes the row. Recovery codes: only
+// the scrypt hash is stored; 30-minute expiry, single use, max 5 attempts.
+
+export const userSessions = sqliteTable("user_sessions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull(),
+  tokenHash: text("token_hash").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const passwordRecovery = sqliteTable("password_recovery", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull(),
+  codeHash: text("code_hash").notNull(),
+  codeSalt: text("code_salt").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+  attempts: integer("attempts").notNull().default(0),
+  used: integer("used").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const loginAttempts = sqliteTable("login_attempts", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  email: text("email").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),

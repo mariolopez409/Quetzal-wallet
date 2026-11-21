@@ -1,5 +1,6 @@
 import {
-randomBytes, scryptSync, createCipheriv, createDecipheriv,
+randomBytes, randomInt, scryptSync, createCipheriv, createDecipheriv,
+createHash, timingSafeEqual,
 } from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -40,4 +41,39 @@ export function decryptText(enc: EncryptedText, passphrase: string): string {
 // operator never sees or types it.
 export function generateServerSecret(): string {
   return randomBytes(32).toString("hex");
+}
+
+// ---------------------------------------------------------------------------
+// Password / recovery-code hashing and session tokens (migration 0008).
+// Passwords and recovery codes are hashed with scrypt and a random per-secret
+// salt; verification is constant-time. Session tokens are 256-bit random
+// values; only their SHA-256 hash is ever stored.
+// ---------------------------------------------------------------------------
+
+export function hashSecret(secret: string): { hash: string; salt: string } {
+  const salt = randomBytes(16);
+  const hash = scryptSync(secret, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+  return { hash: hash.toString("hex"), salt: salt.toString("hex") };
+}
+
+export function verifySecret(secret: string, hashHex: string, saltHex: string): boolean {
+  try {
+    const expected = Buffer.from(hashHex, "hex");
+    const actual = scryptSync(secret, Buffer.from(saltHex, "hex"), 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+    return expected.length === actual.length && timingSafeEqual(expected, actual);
+  } catch {
+    return false;
+  }
+}
+
+export function generateSessionToken(): string {
+  return randomBytes(32).toString("hex");
+}
+
+export function hashToken(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+export function generateRecoveryCode(): string {
+  return String(randomInt(0, 1000000)).padStart(6, "0");
 }

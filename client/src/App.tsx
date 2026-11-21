@@ -5,7 +5,7 @@ import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
 import { api, type ApiResponse } from "./api";
 import type { Actions } from "../../server/src/actions";
-import gtqLogo from "./assets/coins/gtq.svg";
+import gtqLogo from "./assets/coins/gtq.jpg";
 import usdtLogo from "./assets/coins/usdt.png";
 import usdcLogo from "./assets/coins/usdc.png";
 import solLogo from "./assets/coins/sol.png";

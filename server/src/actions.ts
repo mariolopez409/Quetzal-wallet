@@ -240,25 +240,50 @@ const userShape = z.object({
   ledger: z.array(z.object({ network: z.string(), asset: z.string(), balance: z.string() })),
 });
 
-// ---------------- Custody helpers ----------------
+// ---------------- App settings helpers ----------------
 
 function numStr(n: number): string {
   if (!Number.isFinite(n)) return "0";
   const s = n.toFixed(10).replace(/\.?0+$/, "");
   return s === "-0" || s === "" ? "0" : s;
 }
+// There is NO seed vault anymore: the wallet runs only on the operator's
+// Crossmint API key. app_settings holds the GTQ service fee and the server
+// secret the API key is encrypted with.
 
 type Db = ReturnType<Ctx["db"]>;
 
-async function getVaultRow(ctx: Ctx) {
+type SettingsRow = typeof schema.appSettings.$inferSelect;
+
+async function getSettingsRow(ctx: Ctx): Promise<SettingsRow | null> {
   const db = ctx.db<typeof schema>();
-  const rows = await db.select().from(schema.custodyVault).orderBy(asc(schema.custodyVault.id)).limit(1);
+  const rows = await db.select().from(schema.appSettings).orderBy(asc(schema.appSettings.id)).limit(1);
   return rows[0] ?? null;
 }
 
-type VaultRow = NonNullable<Awaited<ReturnType<typeof getVaultRow>>>;
-function vaultEnc(vault: VaultRow) {
-  return { ciphertext: vault.encryptedSeed, salt: vault.salt, iv: vault.iv, authTag: vault.authTag };
+// The GTQ service fee for sends and internal transfers (swaps always pay
+// the fixed 0.1%). Falls back to the schema default if no row exists yet.
+async function getFeeGtq(ctx: Ctx): Promise<string> {
+  const row = await getSettingsRow(ctx);
+  return row?.feeGtq ?? "1";
+}
+
+// Returns the server secret, generating and storing one on first use. The
+// operator never sees or types it: it exists only so the saved Crossmint
+// API key is encrypted at rest while the server can still use it on its own
+// (automatic wallet creation at registration, NC Wallet style).
+async function ensureServerSecret(ctx: Ctx): Promise<string> {
+  const db = ctx.db<typeof schema>();
+  const row = await getSettingsRow(ctx);
+  if (row?.serverSecret) return row.serverSecret;
+  const gen = await ctx.executePrivileged(privileged.generateServerSecret, {});
+  if (row) {
+    await db.update(schema.appSettings).set({ serverSecret: gen.secret })
+      .where(eq(schema.appSettings.id, row.id));
+  } else {
+    await db.insert(schema.appSettings).values({ feeGtq: "1", serverSecret: gen.secret });
+  }
+  return gen.secret;
 }
 
 async function ledgerBalance(db: Db, userId: number, network: string, asset: string): Promise<number> {
@@ -341,17 +366,23 @@ function monthlyLimitGtq(kycStatus: string): number {
 }
 
 // ---------------- Crossmint integration ----------------
-// The operator stores their Crossmint SERVER API key in the admin panel; it is
-// encrypted at rest with the vault passphrase (scrypt + AES-256-GCM, same
-// scheme as the master seed) and only ever decrypted server-side to call the
-// Crossmint Wallets API. Each registered user gets a Solana Smart Wallet with
-// a server signer (the operator is the custodian; the signer secret never
-// leaves the operator). The Crossmint address is bound permanently to the
-// user's email and is the address shown in Recibir and used to read Solana
-// balances.
+// The operator stores their Crossmint SERVER API key in the admin panel; it
+// is encrypted at rest with scrypt + AES-256-GCM under a server secret the
+// app generates automatically — there is NO seed phrase and NO operator
+// passphrase anywhere in this wallet. The key is decrypted only inside
+// server actions to call the Crossmint Wallets API, so each user who
+// registers with their email gets their Solana Smart Wallet (server signer)
+// created automatically, NC Wallet style. The Crossmint address is bound
+// permanently to the user's email and is the address shown in Recibir and
+// used to read Solana balances.
 
 const CROSSMINT_API = "https://www.crossmint.com/api/2025-06-09/wallets";
 const CROSSMINT_SERVER_SIGNER = "84Vx1DJx8RGJizV7gKxLZRcPGTiVofi7Pvn7cjcqTQvy";
+// key_version 2 = encrypted with the automatic server secret. Version 1
+// rows were encrypted with the old vault passphrase and are undecryptable
+// now that the seed vault is gone: the operator saves the key once more.
+const CROSSMINT_KEY_VERSION = 2;
+const LEGACY_KEY_ERROR = "La API key de Crossmint guardada es de la versión anterior (se cifraba con la contraseña de la bóveda, que ya no existe). Vuelve a guardarla en Perfil → Crossmint: ahora solo se pega la API key, sin contraseña ni frase semilla.";
 
 type CrossmintRow = typeof schema.crossmintSettings.$inferSelect;
 
@@ -362,10 +393,15 @@ async function getCrossmintRow(ctx: Ctx): Promise<CrossmintRow | null> {
   return rows[0] ?? null;
 }
 
-async function decryptCrossmintKey(ctx: Ctx, row: CrossmintRow, passphrase: string): Promise<string> {
+// Decrypts the saved API key with the automatic server secret. Returns null
+// when no usable key is saved (none yet, or a legacy version-1 row).
+async function getCrossmintApiKey(ctx: Ctx): Promise<string | null> {
+  const row = await getCrossmintRow(ctx);
+  if (!row || row.keyVersion !== CROSSMINT_KEY_VERSION) return null;
+  const secret = await ensureServerSecret(ctx);
   const dec = await ctx.executePrivileged(privileged.decryptText, {
     ciphertext: row.encryptedApiKey, salt: row.salt, iv: row.iv, authTag: row.authTag,
-    passphrase,
+    passphrase: secret,
   });
   return dec.text;
 }
@@ -417,7 +453,7 @@ async function assertGasBalance(db: Db, userId: number, networkId: string, price
   const addrs = await db.select().from(schema.userAddresses)
     .where(eq(schema.userAddresses.userId, userId));
   const addrRow = addrs.find((a) => a.network === networkId);
-  if (!addrRow) throw new Error("Este usuario no tiene dirección derivada en esta red.");
+  if (!addrRow) throw new Error("Este usuario no tiene dirección en esta red.");
   const userRow = networkId === "solana" ? await getUserRow(db, userId) : null;
   const addr = { ...addrRow, address: solanaAddressFor(userRow, addrRow.address) };
   const rows: AssetRow[] = [];
@@ -437,7 +473,7 @@ async function assertGasBalance(db: Db, userId: number, networkId: string, price
   if (usd < MIN_GAS_USD) {
     throw new Error(
       `Para operar en ${net.name} el usuario debe tener al menos $0.50 USD en ${net.native} para el gas. ` +
-      `Su dirección derivada tiene ${nativeRow.balance} ${net.native} (≈ $${usd.toFixed(2)} USD). Deposita ${net.native} en su dirección de ${net.name} y vuelve a intentarlo.`,
+      `Su dirección tiene ${nativeRow.balance} ${net.native} (≈ $${usd.toFixed(2)} USD). Deposita ${net.native} en su dirección de ${net.name} y vuelve a intentarlo.`,
     );
   }
 }
@@ -757,119 +793,39 @@ export const Actions = {
     },
   }),
 
-  // ---------------- Custodial actions ----------------
+  // ---------------- App settings (fee) ----------------
 
-  getCustodyStatus: defineAction({
-    description: "Returns whether the custodial vault (one encrypted master seed) exists, its label, GTQ fee and user count. Never returns the seed.",
+  getAppSettings: defineAction({
+    description: "Returns the wallet's app settings: the fixed GTQ service fee charged per send and internal transfer (swaps always pay the fixed 0.1% in GTQ).",
     request: z.object({}),
-    response: z.object({
-      initialized: z.boolean(),
-      label: z.string().nullable(),
-      feeGtq: z.string().nullable(),
-      userCount: z.number(),
-      createdAt: z.string().nullable(),
-    }),
+    response: z.object({ feeGtq: z.string() }),
     async handler(ctx) {
-      const db = ctx.db<typeof schema>();
-      const vault = await getVaultRow(ctx);
-      const users = await db.select().from(schema.custodialUsers);
-      return {
-        initialized: vault != null,
-        label: vault?.label ?? null,
-        feeGtq: vault?.feeGtq ?? null,
-        userCount: users.length,
-        createdAt: vault ? vault.createdAt.toISOString() : null,
-      };
+      return { feeGtq: await getFeeGtq(ctx) };
     },
   }),
 
-  setupCustody: defineAction({
-    description: "Creates the custodial vault: generates a new 12-word BIP39 master seed, encrypts it with the operator passphrase (scrypt + AES-256-GCM) and stores only the ciphertext. Returns the seed ONCE for backup.",
-    request: z.object({
-      label: z.string().trim().min(1).max(60),
-      feeGtq: z.string().trim().min(1).max(12),
-      passphrase: z.string().min(8).max(120),
-    }),
-    response: z.object({ mnemonic: z.string() }),
-    privileged: [privileged.generateVault],
-    async handler(ctx, args) {
-      const db = ctx.db<typeof schema>();
-      const existing = await getVaultRow(ctx);
-      if (existing) throw new Error("La bóveda custodial ya existe. No se puede crear otra frase semilla.");
-      const fee = Number(args.feeGtq);
-      if (!Number.isFinite(fee) || fee < 0) throw new Error("La comisión en GTQ no es válida.");
-      const gen = await ctx.executePrivileged(privileged.generateVault, { passphrase: args.passphrase });
-      await db.insert(schema.custodyVault).values({
-        label: args.label, feeGtq: args.feeGtq,
-        encryptedSeed: gen.ciphertext, salt: gen.salt, iv: gen.iv, authTag: gen.authTag,
-      });
-      ctx.invalidateQueries();
-      return { mnemonic: gen.mnemonic };
-    },
-  }),
-
-  importCustody: defineAction({
-    description: "Imports an existing BIP39 seed phrase (12 or 24 words) as the custodial master seed, encrypted with the operator passphrase. The plaintext is never stored.",
-    request: z.object({
-      label: z.string().trim().min(1).max(60),
-      feeGtq: z.string().trim().min(1).max(12),
-      passphrase: z.string().min(8).max(120),
-      mnemonic: z.string().trim().min(20).max(400),
-    }),
-    response: z.object({ ok: z.literal(true) }),
-    privileged: [privileged.importVault],
-    async handler(ctx, args): Promise<{ ok: true }> {
-      const db = ctx.db<typeof schema>();
-      const existing = await getVaultRow(ctx);
-      if (existing) throw new Error("La bóveda custodial ya existe.");
-      const fee = Number(args.feeGtq);
-      if (!Number.isFinite(fee) || fee < 0) throw new Error("La comisión en GTQ no es válida.");
-      const enc = await ctx.executePrivileged(privileged.importVault, {
-        mnemonic: args.mnemonic, passphrase: args.passphrase,
-      });
-      await db.insert(schema.custodyVault).values({
-        label: args.label, feeGtq: args.feeGtq,
-        encryptedSeed: enc.ciphertext, salt: enc.salt, iv: enc.iv, authTag: enc.authTag,
-      });
-      ctx.invalidateQueries();
-      return { ok: true as const };
-    },
-  }),
-
-  recoverSeed: defineAction({
-    description: "Recovery flow: decrypts and returns the master seed phrase only when the operator passphrase is correct.",
-    request: z.object({ passphrase: z.string().min(1).max(120) }),
-    response: z.object({ mnemonic: z.string() }),
-    privileged: [privileged.decryptSeedOnly],
-    async handler(ctx, args) {
-      const vault = await getVaultRow(ctx);
-      if (!vault) throw new Error("Todavía no hay bóveda custodial.");
-      return ctx.executePrivileged(privileged.decryptSeedOnly, { ...vaultEnc(vault), passphrase: args.passphrase });
-    },
-  }),
-
-  updateCustodySettings: defineAction({
-    description: "Updates the custodial vault label and the GTQ service fee charged per send/swap/internal transfer.",
-    request: z.object({
-      label: z.string().trim().min(1).max(60),
-      feeGtq: z.string().trim().min(1).max(12),
-    }),
+  updateAppSettings: defineAction({
+    description: "Updates the fixed GTQ service fee charged per send and internal transfer.",
+    request: z.object({ feeGtq: z.string().trim().min(1).max(12) }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
       const db = ctx.db<typeof schema>();
-      const vault = await getVaultRow(ctx);
-      if (!vault) throw new Error("Todavía no hay bóveda custodial.");
       const fee = Number(args.feeGtq);
       if (!Number.isFinite(fee) || fee < 0) throw new Error("La comisión en GTQ no es válida.");
-      await db.update(schema.custodyVault).set({ label: args.label, feeGtq: args.feeGtq })
-        .where(eq(schema.custodyVault.id, vault.id));
+      const row = await getSettingsRow(ctx);
+      if (row) {
+        await db.update(schema.appSettings).set({ feeGtq: args.feeGtq })
+          .where(eq(schema.appSettings.id, row.id));
+      } else {
+        await db.insert(schema.appSettings).values({ feeGtq: args.feeGtq });
+      }
       ctx.invalidateQueries();
       return { ok: true as const };
     },
   }),
 
   listUsers: defineAction({
-    description: "Lists all custodial users with their derived deposit addresses for all 12 networks and their internal ledger balances.",
+    description: "Lists all custodial users with their deposit addresses (Crossmint wallet on Solana; legacy users keep the addresses they already had) and their internal ledger balances.",
     request: z.object({}),
     response: z.object({ users: z.array(userShape) }),
     async handler(ctx) {
@@ -882,52 +838,49 @@ export const Actions = {
   }),
 
   createUser: defineAction({
-    description: "Registers a custodial user with their email (permanent binding: the email can never be changed or reused, and the addresses stay linked to it forever), derives their deposit addresses for all 12 networks from the master seed by account index, and — when a Crossmint API key is saved — also creates their Crossmint Solana Smart Wallet (server signer) and binds its address permanently to the email.",
+    description: "Registers a user with their email (permanent binding: the email can never be changed or reused, and the wallet stays linked to it forever) and automatically creates their Crossmint Solana Smart Wallet (server signer) with the operator's saved API key — no seed phrase, no passphrase. The Crossmint address is also stored as the user's Solana address so balances, deposit sync and the gas check use it. A Crossmint failure never loses the registration; it is returned so the wallet can be created later from the Crossmint panel.",
     request: z.object({
       name: z.string().trim().min(1).max(60),
       email: z.string().trim().min(3).max(120),
-      passphrase: z.string().min(1).max(120),
     }),
     response: z.object({ user: userShape, crossmintError: z.string().nullable() }),
-    privileged: [privileged.deriveAddresses, privileged.decryptText],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const vault = await getVaultRow(ctx);
-      if (!vault) throw new Error("Primero crea la bóveda custodial con su frase semilla cifrada.");
       const email = args.email.trim().toLowerCase();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("El correo electrónico no es válido.");
       const existing = await db.select().from(schema.custodialUsers).orderBy(asc(schema.custodialUsers.accountIndex));
       if (existing.some((u) => u.email.toLowerCase() === email)) {
-        throw new Error("Ese correo ya está registrado y ligado permanentemente a las direcciones de su cuenta. Inicia sesión con ese correo en lugar de crear otra cuenta.");
+        throw new Error("Ese correo ya está registrado y ligado permanentemente a la wallet de su cuenta. Inicia sesión con ese correo en lugar de crear otra cuenta.");
       }
       const nextIndex = existing.length === 0 ? 0 : Math.max(...existing.map((u) => u.accountIndex)) + 1;
-      // Decrypt + derive inside the privileged handler: the mnemonic never leaves it.
-      const derivedRes = await ctx.executePrivileged(privileged.deriveAddresses, {
-        ...vaultEnc(vault), passphrase: args.passphrase, accountIndex: nextIndex,
-      });
       const inserted = await db.insert(schema.custodialUsers)
         .values({ name: args.name, email, accountIndex: nextIndex })
         .returning();
       const user = inserted[0];
       if (!user) throw new Error("No se pudo crear el usuario.");
-      for (const d of derivedRes.addresses) {
-        await db.insert(schema.userAddresses).values({
-          userId: user.id, network: d.network, address: d.address, derivationPath: d.path,
-        });
-      }
-      // Crossmint: create the user's Solana Smart Wallet now that the email
-      // is registered. A Crossmint failure must not lose the registration:
-      // the error is returned so the operator can retry from the admin panel.
+      // Crossmint is the ONLY wallet provider: the user's wallet is created
+      // automatically from the saved API key alone. A failure must not lose
+      // the registration: the error is returned so the operator can retry
+      // from the Crossmint panel.
       let crossmintError: string | null = null;
       const cmRow = await getCrossmintRow(ctx);
-      if (cmRow) {
+      if (cmRow && cmRow.keyVersion !== CROSSMINT_KEY_VERSION) {
+        crossmintError = LEGACY_KEY_ERROR;
+      } else if (cmRow) {
         try {
-          const apiKey = await decryptCrossmintKey(ctx, cmRow, args.passphrase);
+          const apiKey = await getCrossmintApiKey(ctx);
+          if (!apiKey) throw new Error("No se pudo leer la API key de Crossmint guardada.");
           const address = await crossmintCreateWallet(apiKey, email, cmRow.serverSignerAddress);
           await db.update(schema.custodialUsers)
             .set({ crossmintAddress: address })
             .where(eq(schema.custodialUsers.id, user.id));
           user.crossmintAddress = address;
+          // The Crossmint address IS the user's Solana address: storing it
+          // as their Solana address row makes balance reads, automatic
+          // deposit sync and the $0.50 gas check work with no other address.
+          await db.insert(schema.userAddresses).values({
+            userId: user.id, network: "solana", address, derivationPath: "crossmint",
+          });
         } catch (e) {
           crossmintError = e instanceof Error ? e.message : "No se pudo crear la wallet de Crossmint.";
         }
@@ -938,7 +891,7 @@ export const Actions = {
   }),
 
   findUserByEmail: defineAction({
-    description: "Email login: finds the custodial account permanently bound to an email address and returns it with its derived addresses and ledger balances, or null if no account is registered with that email.",
+    description: "Email login: finds the account permanently bound to an email address and returns it with its addresses and ledger balances, or null if no account is registered with that email.",
     request: z.object({ email: z.string().trim().min(3).max(120) }),
     response: z.object({ user: userShape.nullable() }),
     async handler(ctx, args) {
@@ -952,7 +905,7 @@ export const Actions = {
   }),
 
   getUserBalances: defineAction({
-    description: "Reads live on-chain balances for one custodial user's derived addresses across all networks, GTQ first, with USD reference prices.",
+    description: "Reads live on-chain balances for one user's addresses across all networks (their Crossmint wallet on Solana), GTQ first, with USD reference prices.",
     request: z.object({ userId: z.number().int().positive() }),
     response: z.object({
       assets: z.array(z.object({
@@ -1006,7 +959,7 @@ export const Actions = {
   }),
 
   syncUserDeposits: defineAction({
-    description: "Syncs one user's deposits: reads live on-chain balances at their derived addresses and credits the internal ledger with any increase since the last sync.",
+    description: "Syncs one user's deposits: reads live on-chain balances at their addresses and credits the internal ledger with any increase since the last sync.",
     request: z.object({ userId: z.number().int().positive() }),
     response: z.object({
       credited: z.array(z.object({ network: z.string(), asset: z.string(), amount: z.string() })),
@@ -1015,7 +968,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const rawAddrs = await db.select().from(schema.userAddresses).where(eq(schema.userAddresses.userId, args.userId));
-      if (rawAddrs.length === 0) throw new Error("Usuario sin direcciones derivadas.");
+      if (rawAddrs.length === 0) throw new Error("Usuario sin direcciones.");
       const credited = await syncOneUser(db, args.userId);
       ctx.invalidateQueries();
       return { credited, fetchedAt: new Date().toISOString() };
@@ -1090,7 +1043,7 @@ export const Actions = {
   }),
 
   internalTransfer: defineAction({
-    description: "Instant internal transfer between two custodial users on the same network/asset, settled only on the internal ledger. Charges the vault GTQ fee to the sender (in GTQ, on Solana ledger).",
+    description: "Instant internal transfer between two custodial users on the same network/asset, settled only on the internal ledger. Charges the app GTQ service fee to the sender (in GTQ, on Solana ledger).",
     request: z.object({
       fromUserId: z.number().int().positive(),
       toUserId: z.number().int().positive(),
@@ -1105,24 +1058,23 @@ export const Actions = {
       if (args.fromUserId === args.toUserId) throw new Error("Elige dos usuarios distintos.");
       const amount = Number(args.amount);
       if (!Number.isFinite(amount) || amount <= 0) throw new Error("La cantidad no es válida.");
-      const vault = await getVaultRow(ctx);
-      if (!vault) throw new Error("No hay bóveda custodial.");
-      const fee = Number(vault.feeGtq) || 0;
+      const feeGtq = await getFeeGtq(ctx);
+      const fee = Number(feeGtq) || 0;
       const fromBal = await ledgerBalance(db, args.fromUserId, args.network, args.asset);
       if (fromBal < amount) throw new Error(`Saldo interno insuficiente: el remitente tiene ${numStr(fromBal)} ${args.asset} en ${args.network}.`);
       if (fee > 0 && args.asset !== "GTQ") {
         const gtqBal = await ledgerBalance(db, args.fromUserId, "solana", "GTQ");
-        if (gtqBal < fee) throw new Error(`El remitente necesita ${vault.feeGtq} GTQ para la comisión y tiene ${numStr(gtqBal)} GTQ.`);
+        if (gtqBal < fee) throw new Error(`El remitente necesita ${feeGtq} GTQ para la comisión y tiene ${numStr(gtqBal)} GTQ.`);
       }
       if (fee > 0 && args.asset === "GTQ" && args.network === "solana" && fromBal < amount + fee) {
-        throw new Error(`Saldo insuficiente: cantidad + comisión (${vault.feeGtq} GTQ) supera el saldo.`);
+        throw new Error(`Saldo insuficiente: cantidad + comisión (${feeGtq} GTQ) supera el saldo.`);
       }
       await adjustLedger(db, args.fromUserId, args.network, args.asset, -amount);
       await adjustLedger(db, args.toUserId, args.network, args.asset, amount);
       if (fee > 0) await adjustLedger(db, args.fromUserId, "solana", "GTQ", -fee);
       await db.insert(schema.ledgerEntries).values({
         userId: args.fromUserId, kind: "internal_out", network: args.network, asset: args.asset,
-        amount: numStr(-amount), feeGtq: vault.feeGtq, relatedUserId: args.toUserId, note: args.note,
+        amount: numStr(-amount), feeGtq, relatedUserId: args.toUserId, note: args.note,
       });
       await db.insert(schema.ledgerEntries).values({
         userId: args.toUserId, kind: "internal_in", network: args.network, asset: args.asset,
@@ -1136,7 +1088,7 @@ export const Actions = {
       }
       await db.insert(schema.transactions).values({
         kind: "internal", network: args.network, fromAsset: args.asset, toAsset: args.asset,
-        amount: args.amount, feeGtq: vault.feeGtq, toAddress: null,
+        amount: args.amount, feeGtq, toAddress: null,
         note: args.note, payload: "", status: "completada",
         userId: args.fromUserId, relatedUserId: args.toUserId,
       });
@@ -1164,8 +1116,6 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const amount = Number(args.amount);
       if (!Number.isFinite(amount) || amount <= 0) throw new Error("La cantidad no es válida.");
-      const vault = await getVaultRow(ctx);
-      if (!vault) throw new Error("No hay bóveda custodial.");
       const userRows = await db.select().from(schema.custodialUsers)
         .where(eq(schema.custodialUsers.id, args.userId));
       const user = userRows[0];
@@ -1173,7 +1123,7 @@ export const Actions = {
       const prices = await fetchPrices();
       // Gas: at least $0.50 USD of the network's native coin on-chain.
       await assertGasBalance(db, args.userId, args.network, prices);
-      // Fee: sends pay the vault's fixed GTQ service fee; swaps pay a fixed
+      // Fee: sends pay the app's fixed GTQ service fee; swaps pay a fixed
       // 0.1% of the swapped amount, charged in GTQ.
       let fee: number;
       if (args.kind === "swap") {
@@ -1185,7 +1135,7 @@ export const Actions = {
         }
         fee = Math.round(fee * 1e6) / 1e6;
       } else {
-        fee = Number(vault.feeGtq) || 0;
+        fee = Number(await getFeeGtq(ctx)) || 0;
         // Monthly withdrawal limit (sends are the withdrawals).
         const limit = monthlyLimitGtq(user.kycStatus);
         const usage = await monthlyUsageGtq(db, args.userId, prices);
@@ -1355,10 +1305,11 @@ export const Actions = {
   // ---------------- Crossmint admin actions ----------------
 
   getCrossmintStatus: defineAction({
-    description: "Returns whether a Crossmint server API key is saved (encrypted) in the app, the server signer address used for user Smart Wallets, and how many users already have a Crossmint wallet. Never returns the key.",
+    description: "Returns whether a usable Crossmint server API key is saved (encrypted) in the app, whether the saved key is a legacy one that must be re-saved (it was encrypted with the removed vault passphrase), the server signer address used for user Smart Wallets, and how many users already have a Crossmint wallet. Never returns the key.",
     request: z.object({}),
     response: z.object({
       configured: z.boolean(),
+      legacyKey: z.boolean(),
       serverSignerAddress: z.string(),
       usersWithWallet: z.number(),
       usersTotal: z.number(),
@@ -1369,7 +1320,8 @@ export const Actions = {
       const row = await getCrossmintRow(ctx);
       const users = await db.select().from(schema.custodialUsers);
       return {
-        configured: row != null,
+        configured: row != null && row.keyVersion === CROSSMINT_KEY_VERSION,
+        legacyKey: row != null && row.keyVersion !== CROSSMINT_KEY_VERSION,
         serverSignerAddress: row?.serverSignerAddress ?? CROSSMINT_SERVER_SIGNER,
         usersWithWallet: users.filter((u) => u.crossmintAddress).length,
         usersTotal: users.length,
@@ -1379,10 +1331,9 @@ export const Actions = {
   }),
 
   saveCrossmintKey: defineAction({
-    description: "Saves the operator's Crossmint server API key in the admin panel, encrypted at rest with the vault passphrase (scrypt + AES-256-GCM). The key is verified against the Crossmint API before saving; the plaintext is never stored or returned.",
+    description: "Saves the operator's Crossmint server API key in the admin panel — the ONLY credential this wallet uses. It is verified against the Crossmint API before saving and stored encrypted at rest (scrypt + AES-256-GCM) under a server secret the app generates automatically: no seed phrase and no passphrase are asked. The plaintext is never stored in the clear or returned.",
     request: z.object({
       apiKey: z.string().trim().min(10).max(300),
-      passphrase: z.string().min(1).max(120),
       serverSignerAddress: z.string().trim().min(32).max(64).default(CROSSMINT_SERVER_SIGNER),
     }),
     response: z.object({ ok: z.literal(true) }),
@@ -1402,18 +1353,21 @@ export const Actions = {
       if (!probe.ok && probe.status !== 404) {
         throw new Error(`Crossmint respondió HTTP ${probe.status} al verificar la API key. No se guardó.`);
       }
+      const secret = await ensureServerSecret(ctx);
       const enc = await ctx.executePrivileged(privileged.encryptText, {
-        text: args.apiKey, passphrase: args.passphrase,
+        text: args.apiKey, passphrase: secret,
       });
       const existing = await getCrossmintRow(ctx);
       if (existing) {
         await db.update(schema.crossmintSettings).set({
           encryptedApiKey: enc.ciphertext, salt: enc.salt, iv: enc.iv, authTag: enc.authTag,
+          keyVersion: CROSSMINT_KEY_VERSION,
           serverSignerAddress: args.serverSignerAddress,
         }).where(eq(schema.crossmintSettings.id, existing.id));
       } else {
         await db.insert(schema.crossmintSettings).values({
           encryptedApiKey: enc.ciphertext, salt: enc.salt, iv: enc.iv, authTag: enc.authTag,
+          keyVersion: CROSSMINT_KEY_VERSION,
           serverSignerAddress: args.serverSignerAddress,
         });
       }
@@ -1423,26 +1377,33 @@ export const Actions = {
   }),
 
   createUserCrossmintWallet: defineAction({
-    description: "Creates (or fetches, if it already exists) the Crossmint Solana Smart Wallet for one registered user and binds its address permanently to the user's email. Used to retry or to backfill users registered before the API key was saved.",
+    description: "Creates (or fetches, if it already exists) the Crossmint Solana Smart Wallet for one registered user with the saved API key and binds its address permanently to the user's email. Used to retry or to backfill users registered before the API key was saved. Also stores the address as the user's Solana address row when they have none.",
     request: z.object({
       userId: z.number().int().positive(),
-      passphrase: z.string().min(1).max(120),
     }),
     response: z.object({ address: z.string() }),
-    privileged: [privileged.decryptText],
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const cmRow = await getCrossmintRow(ctx);
       if (!cmRow) throw new Error("Primero guarda tu API key de Crossmint en el panel de administración.");
+      if (cmRow.keyVersion !== CROSSMINT_KEY_VERSION) throw new Error(LEGACY_KEY_ERROR);
       const user = await getUserRow(db, args.userId);
       if (!user) throw new Error("Usuario no encontrado.");
       if (!user.email) throw new Error("Este usuario no tiene correo registrado: la wallet de Crossmint se liga al correo.");
       if (user.crossmintAddress) return { address: user.crossmintAddress };
-      const apiKey = await decryptCrossmintKey(ctx, cmRow, args.passphrase);
+      const apiKey = await getCrossmintApiKey(ctx);
+      if (!apiKey) throw new Error("No se pudo leer la API key de Crossmint guardada.");
       const address = await crossmintCreateWallet(apiKey, user.email, cmRow.serverSignerAddress);
       await db.update(schema.custodialUsers)
         .set({ crossmintAddress: address })
         .where(eq(schema.custodialUsers.id, user.id));
+      const addrs = await db.select().from(schema.userAddresses)
+        .where(eq(schema.userAddresses.userId, user.id));
+      if (!addrs.some((a) => a.network === "solana")) {
+        await db.insert(schema.userAddresses).values({
+          userId: user.id, network: "solana", address, derivationPath: "crossmint",
+        });
+      }
       ctx.invalidateQueries();
       return { address };
     },

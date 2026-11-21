@@ -48,8 +48,26 @@ export const contacts = sqliteTable("contacts", {
     .$defaultFn(() => new Date()),
 });
 
-// ---------------- Custodial model ----------------
+// ---------------- App settings (no seed vault) ----------------
+// Since the Crossmint-only rework there is NO master seed phrase anywhere in
+// the wallet: users' wallets are Crossmint Smart Wallets created with the
+// operator's API key alone. This single row holds the GTQ service fee and
+// the server secret the API key is encrypted with (generated automatically
+// on the server; the operator never types a passphrase).
 
+export const appSettings = sqliteTable("app_settings", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  feeGtq: text("fee_gtq").notNull().default("1"),
+  serverSecret: text("server_secret").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// LEGACY — the old seed-phrase vault table. No action reads or writes it
+// anymore; the row is left untouched in the database only because deleting
+// the encrypted blob would permanently strand any funds sitting at the
+// addresses derived from it in earlier versions.
 export const custodyVault = sqliteTable("custody_vault", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   label: text("label").notNull(),
@@ -77,11 +95,14 @@ export const custodialUsers = sqliteTable("custodial_users", {
 });
 
 // ---------------- Crossmint integration ----------------
-// The operator's Crossmint server API key, stored encrypted at rest with the
-// same scrypt + AES-256-GCM scheme as the custody vault (encrypted with the
-// vault passphrase by the privileged handlers). The plaintext key never
-// reaches the client; it is decrypted only inside server actions to call the
-// Crossmint Wallets API.
+// The operator's Crossmint server API key, stored encrypted at rest with
+// scrypt + AES-256-GCM. The encryption passphrase is a server secret the app
+// generates automatically (app_settings.server_secret) — there is no seed
+// phrase and no operator passphrase anywhere. The plaintext key never
+// reaches the client; it is decrypted only inside server actions to call
+// the Crossmint Wallets API. key_version 1 rows were encrypted with the old
+// vault passphrase and can no longer be decrypted: the key must be saved
+// again from the admin panel.
 
 export const crossmintSettings = sqliteTable("crossmint_settings", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -89,6 +110,7 @@ export const crossmintSettings = sqliteTable("crossmint_settings", {
   salt: text("salt").notNull(),
   iv: text("iv").notNull(),
   authTag: text("auth_tag").notNull(),
+  keyVersion: integer("key_version").notNull().default(1),
   serverSignerAddress: text("server_signer_address").notNull()
     .default("84Vx1DJx8RGJizV7gKxLZRcPGTiVofi7Pvn7cjcqTQvy"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })

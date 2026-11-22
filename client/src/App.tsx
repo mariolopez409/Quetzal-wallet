@@ -16,7 +16,6 @@ const tok = () => getSessionToken() ?? "";
 type Network = ApiResponse<typeof api, "getNetworks">["networks"][number];
 type Tx = ApiResponse<typeof api, "listTransactions">["transactions"][number];
 type CustUser = ApiResponse<typeof api, "listUsers">["users"][number];
-type LedgerEntry = ApiResponse<typeof api, "listLedgerEntries">["entries"][number];
 
 const GTQ_MINT = "GTqK16bpGTqhYhXQzfHCxySJW4EswwtNw6THJ8VAMcXd";
 
@@ -34,9 +33,11 @@ function assetsForNetwork(net: Network | undefined): string[] {
   if (net.id === "tron") return ["TRX", "USDT", "USDC"];
   return [net.native, "USDT", "USDC"];
 }
-function ledgerOf(user: CustUser | null, network: string, asset: string): string | null {
-  if (!user) return null;
-  return user.ledger.find((l) => l.network === network && l.asset === asset)?.balance ?? "0";
+// Balances come only from Crossmint (getUserBalances): the balance of an
+// asset in the list the server read from the user's Crossmint wallet.
+function balanceOf(assets: { network: string; asset: string; balance: string }[] | undefined, network: string, asset: string): string | null {
+  if (!assets) return null;
+  return assets.find((a) => a.network === network && a.asset === asset)?.balance ?? "0";
 }
 
 // --- Coin logos + one-row-per-coin aggregation (NC Wallet style) ---
@@ -236,7 +237,8 @@ function SettingsPanel({ feeGtq }: { feeGtq: string }) {
         <h3 className="text-sm font-semibold">Cómo funciona esta wallet</h3>
         <p className="mt-1 text-sm text-[var(--dim)]">
           No hay frase semilla: cada usuario recibe una Smart Wallet de Crossmint (Solana) creada solo con la
-          API key del operador y ligada a su correo. Los saldos viven en el libro de la app.
+          API key del operador y ligada a su correo. La app es solo la pantalla: los saldos se leen de Crossmint
+          y cada envío se crea, se firma y se ejecuta en Crossmint.
         </p>
       </div>
 
@@ -244,7 +246,7 @@ function SettingsPanel({ feeGtq }: { feeGtq: string }) {
         <div>
           <label htmlFor="u-fee" className={labelCls}>Comisión fija de envío y transferencia entre usuarios (en GTQ)</label>
           <input id="u-fee" {...FIELDS.updateAppSettings.feeGtq} inputMode="decimal" className={inputCls} value={newFee} onChange={(e) => setNewFee(e.target.value)} />
-          <p className="mt-1 text-xs text-[var(--dim)]">El swap cobra 0.1% fijo, en GTQ. Toda comisión se paga en GTQ.</p>
+          <p className="mt-1 text-xs text-[var(--dim)]">La comisión se cobra en GTQ como una transferencia real de Crossmint a la wallet del operador.</p>
         </div>
         {savedMsg && <p className="text-sm text-[var(--accent-text)]">{savedMsg}</p>}
         {error && <p role="alert" className="text-sm text-[var(--danger)]">{error}</p>}
@@ -505,65 +507,8 @@ function ChangePasswordForm() {
   );
 }
 
-function CreditDepositForm({ user, networks }: { user: CustUser; networks: Network[] }) {
-  const queryClient = useQueryClient();
-  const [network, setNetwork] = useState("solana");
-  const net = networks.find((n) => n.id === network);
-  const [asset, setAsset] = useState("GTQ");
-  const [amount, setAmount] = useState("");
-  const [note, setNote] = useState("");
-  const [error, setError] = useState("");
-  const [msg, setMsg] = useState("");
-  const credit = useMutation({
-    mutationFn: async () => api.creditDeposit({ sessionToken: tok(), userId: user.id, network, asset, amount, note }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["users"] });
-      queryClient.invalidateQueries({ queryKey: ["transactions"] });
-      setAmount(""); setMsg("Depósito acreditado a la cuenta de " + user.name + ".");
-    },
-    onError: (e) => setError(e instanceof Error ? e.message : "No se pudo acreditar."),
-  });
-  const submit = (ev: FormEvent) => {
-    ev.preventDefault();
-    setError(""); setMsg("");
-    if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) { setError("Escribe una cantidad válida."); return; }
-    credit.mutate();
-  };
-  return (
-    <form onSubmit={submit} className="space-y-3 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4">
-      <p className="text-sm font-semibold">Agregar saldo manualmente a {user.name}</p>
-      <p className="text-xs text-[var(--dim)]">Cuenta para el límite mensual de depósitos (10,000 GTQ sin KYC · 1,000,000 GTQ con KYC).</p>
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label htmlFor="cd-net" className={labelCls}>Red</label>
-          <select id="cd-net" className={inputCls} value={network} onChange={(e) => { setNetwork(e.target.value); setAsset(assetsForNetwork(networks.find((n) => n.id === e.target.value))[0] ?? "GTQ"); }}>
-            {networks.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}
-          </select>
-        </div>
-        <div>
-          <label htmlFor="cd-asset" className={labelCls}>Moneda</label>
-          <select id="cd-asset" className={inputCls} value={asset} onChange={(e) => setAsset(e.target.value)}>
-            {assetsForNetwork(net).map((a) => <option key={a} value={a}>{a}</option>)}
-          </select>
-        </div>
-      </div>
-      <div>
-        <label htmlFor="cd-amount" className={labelCls}>Cantidad</label>
-        <input id="cd-amount" {...FIELDS.creditDeposit.amount} inputMode="decimal" className={inputCls} value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" />
-      </div>
-      <div>
-        <label htmlFor="cd-note" className={labelCls}>Nota (opcional)</label>
-        <input id="cd-note" {...FIELDS.creditDeposit.note} className={inputCls} value={note} onChange={(e) => setNote(e.target.value)} />
-      </div>
-      {error && <p role="alert" className="text-sm text-[var(--danger)]">{error}</p>}
-      {msg && <p className="text-sm text-[var(--accent-text)]">{msg}</p>}
-      <button type="submit" className={btnPrimary} disabled={credit.isPending}>{credit.isPending ? "Acreditando…" : "Acreditar depósito"}</button>
-    </form>
-  );
-}
-
 // ---------------------------------------------------------------------------
-// Send / Swap per user (ledger)
+// Send per user — executed for real in Crossmint (create + sign + submit)
 // ---------------------------------------------------------------------------
 
 function SendForm({ user, networks, fee, onDone, initialNetwork = "solana", initialAsset = "GTQ" }: {
@@ -583,11 +528,8 @@ function SendForm({ user, networks, fee, onDone, initialNetwork = "solana", init
   const contacts = useQuery({ queryKey: ["contacts"], queryFn: () => api.listContacts({ sessionToken: tok() }) });
   const chainQ = useQuery({ queryKey: ["userBalances", user.id], queryFn: () => api.getUserBalances({ userId: user.id, sessionToken: tok() }) });
 
-  const balance = ledgerOf(user, network, asset);
-  const gtqBalance = ledgerOf(user, "solana", "GTQ");
-  const nativeSym = net?.native ?? "";
-  const nativeRow = chainQ.data?.assets.find((a) => a.network === network && a.asset === nativeSym);
-  const gasUsd = nativeRow && nativeRow.usdPrice != null ? Number(nativeRow.balance) * nativeRow.usdPrice : null;
+  const balance = balanceOf(chainQ.data?.assets, network, asset);
+  const gtqBalance = balanceOf(chainQ.data?.assets, "solana", "GTQ");
 
   const handleScan = (raw: string) => {
     setScanning(false);
@@ -600,23 +542,19 @@ function SendForm({ user, networks, fee, onDone, initialNetwork = "solana", init
   };
 
   const record = useMutation({
-    mutationFn: async () => {
-      const payload = network === "solana"
-        ? `solana:${to}?amount=${amount}${asset === "GTQ" ? `&spl-token=${GTQ_MINT}` : ""}&label=Quetzal%20Wallet`
-        : `${asset} en ${net?.name ?? network} → ${to}: ${amount}`;
-      return api.recordUserTransaction({
+    mutationFn: async () =>
+      api.recordUserTransaction({
         sessionToken: tok(),
         userId: user.id, kind: "send", network, fromAsset: asset, toAsset: null,
-        amount, toAddress: to, note, payload, receiveAmount: "",
-      });
-    },
+        amount, toAddress: to, note, payload: "", receiveAmount: "",
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["transactions"] });
       queryClient.invalidateQueries({ queryKey: ["users"] });
-      queryClient.invalidateQueries({ queryKey: ["ledger", user.id] });
+      queryClient.invalidateQueries({ queryKey: ["userBalances", user.id] });
       onDone();
     },
-    onError: (e) => setError(e instanceof Error ? e.message : "No se pudo registrar el envío."),
+    onError: (e) => setError(e instanceof Error ? e.message : "No se pudo ejecutar el envío."),
   });
 
   const startReview = () => {
@@ -644,10 +582,10 @@ function SendForm({ user, networks, fee, onDone, initialNetwork = "solana", init
           <div className="flex justify-between"><dt className="text-[var(--dim)]">Comisión (en GTQ)</dt><dd className="tnum font-semibold text-[var(--gold)]">{fee} GTQ</dd></div>
           {note && <div className="flex justify-between gap-4"><dt className="text-[var(--dim)]">Nota</dt><dd className="text-right">{note}</dd></div>}
         </dl>
-        <p className="text-xs text-[var(--dim)]">Se descuenta de la cuenta de {user.name} (cantidad + comisión en GTQ).</p>
+        <p className="text-xs text-[var(--dim)]">Crossmint ejecuta el envío desde la wallet de {user.name}: la transacción se firma con el firmante del servidor y sale a la red Solana. La comisión se cobra en GTQ con otra transferencia de Crossmint.</p>
         {error && <p role="alert" className="text-sm text-[var(--danger)]">{error}</p>}
         <button type="button" className={btnPrimary} disabled={record.isPending} onClick={() => record.mutate()}>
-          {record.isPending ? "Firmando…" : "Firmar y confirmar envío"}
+          {record.isPending ? "Firmando en Crossmint…" : "Firmar y enviar con Crossmint"}
         </button>
         <button type="button" className={`${btnGhost} w-full`} onClick={() => setReview(false)}>Volver a editar</button>
       </div>
@@ -695,152 +633,7 @@ function SendForm({ user, networks, fee, onDone, initialNetwork = "solana", init
         <input id="send-note" {...FIELDS.recordUserTransaction.note} className={inputCls} value={note} onChange={(e) => setNote(e.target.value)} />
       </div>
       <p className="text-sm text-[var(--dim)]">Comisión de servicio: <span className="tnum font-semibold text-[var(--gold)]">{fee} GTQ</span></p>
-      {gasUsd != null && nativeRow ? (
-        <p className="text-sm text-[var(--dim)]">
-          Gas: <span className="tnum">{nativeRow.balance} {nativeSym}</span> ≈ {fmtUsd(gasUsd)}
-          {gasUsd < 0.5
-            ? <span className="text-[var(--danger)]"> · se requieren al menos $0.50 USD en {nativeSym} para el gas.</span>
-            : <span className="text-[var(--accent-text)]"> · gas OK (mín. $0.50).</span>}
-        </p>
-      ) : (
-        <p className="text-sm text-[var(--dim)]">Gas: se requieren al menos $0.50 USD en {nativeSym || "la moneda nativa"} en su dirección.</p>
-      )}
-      {error && <p role="alert" className="text-sm text-[var(--danger)]">{error}</p>}
-      <button type="button" className={btnPrimary} onClick={startReview}>Revisar y firmar</button>
-    </div>
-  );
-}
-
-function SwapForm({ user, networks, onDone, initialNetwork = "solana", initialAsset = "" }: {
-  user: CustUser; networks: Network[]; onDone: () => void;
-  initialNetwork?: string; initialAsset?: string;
-}) {
-  const queryClient = useQueryClient();
-  const [network, setNetwork] = useState(initialNetwork);
-  const net = networks.find((n) => n.id === network);
-  const options = assetsForNetwork(net);
-  const [from, setFrom] = useState(initialAsset && options.includes(initialAsset) ? initialAsset : "GTQ");
-  const [toAsset, setToAsset] = useState(from === "USDC" ? "GTQ" : "USDC");
-  const [amount, setAmount] = useState("");
-  const [receive, setReceive] = useState("");
-  const [review, setReview] = useState(false);
-  const [error, setError] = useState("");
-  const pricesQ = useQuery({ queryKey: ["userBalances", user.id], queryFn: () => api.getUserBalances({ userId: user.id, sessionToken: tok() }) });
-  const priceOf = (sym: string) => pricesQ.data?.assets.find((b) => b.asset === sym && b.usdPrice != null)?.usdPrice ?? null;
-  const fromPrice = priceOf(from);
-  const toPrice = priceOf(toAsset);
-  const autoReceive = fromPrice != null && toPrice != null && Number(amount) > 0
-    ? (Number(amount) * fromPrice / toPrice).toFixed(6)
-    : null;
-  const receiveValue = autoReceive ?? receive;
-  // Swap fee: fixed 0.1% of the swapped amount, charged in GTQ. When a leg is
-  // GTQ the fee comes straight from that leg; otherwise the USD value of the
-  // 0.1% is used as GTQ-equivalent units (GTQ has no public market price).
-  const amtNum = Number(amount) || 0;
-  const feeEstimate = from === "GTQ"
-    ? amtNum * 0.001
-    : toAsset === "GTQ" && Number(receiveValue) > 0
-      ? Number(receiveValue) * 0.001
-      : fromPrice != null
-        ? amtNum * 0.001 * fromPrice
-        : null;
-  const feeLabel = feeEstimate != null
-    ? `${feeEstimate.toLocaleString("en-US", { maximumFractionDigits: 6 })} GTQ`
-    : "0.1% del monto, en GTQ";
-  const nativeRowS = pricesQ.data?.assets.find((a) => a.network === network && a.asset === (net?.native ?? ""));
-  const gasUsdS = nativeRowS && nativeRowS.usdPrice != null ? Number(nativeRowS.balance) * nativeRowS.usdPrice : null;
-
-  const record = useMutation({
-    mutationFn: async () =>
-      api.recordUserTransaction({
-      sessionToken: tok(),
-        userId: user.id, kind: "swap", network, fromAsset: from, toAsset: toAsset,
-        amount, toAddress: null, note: `Recibe ≈ ${receiveValue} ${toAsset}`,
-        payload: `swap:${network}:${amount} ${from} -> ${receiveValue} ${toAsset}`,
-        receiveAmount: receiveValue,
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["transactions"] });
-      queryClient.invalidateQueries({ queryKey: ["users"] });
-      queryClient.invalidateQueries({ queryKey: ["ledger", user.id] });
-      onDone();
-    },
-    onError: (e) => setError(e instanceof Error ? e.message : "No se pudo registrar el swap."),
-  });
-
-  const startReview = () => {
-    setError("");
-    if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) { setError("Escribe una cantidad válida."); return; }
-    if (from === toAsset) { setError("Elige dos monedas distintas."); return; }
-    if (!receiveValue || Number(receiveValue) <= 0) { setError("Escribe cuánto va a recibir."); return; }
-    const bal = ledgerOf(user, network, from);
-    if (bal != null && Number(amount) > Number(bal)) { setError(`Saldo insuficiente: tiene ${bal} ${from}.`); return; }
-    setReview(true);
-  };
-
-  if (review) {
-    return (
-      <div className="space-y-4">
-        <h3 className="font-display text-lg font-bold">Revisa y firma el swap de {user.name}</h3>
-        <dl className="space-y-2 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4 text-sm">
-          <div className="flex justify-between"><dt className="text-[var(--dim)]">Entrega</dt><dd className="tnum font-semibold">{amount} {from}</dd></div>
-          <div className="flex justify-between"><dt className="text-[var(--dim)]">Recibe ≈</dt><dd className="tnum font-semibold">{receiveValue} {toAsset}</dd></div>
-          <div className="flex justify-between"><dt className="text-[var(--dim)]">Red</dt><dd>{net?.name}</dd></div>
-          <div className="flex justify-between"><dt className="text-[var(--dim)]">Comisión de swap (0.1% fijo, en GTQ)</dt><dd className="tnum font-semibold text-[var(--gold)]">{feeLabel}</dd></div>
-        </dl>
-        <p className="text-xs text-[var(--dim)]">Se liquida en la cuenta de {user.name}.</p>
-        {error && <p role="alert" className="text-sm text-[var(--danger)]">{error}</p>}
-        <button type="button" className={btnPrimary} disabled={record.isPending} onClick={() => record.mutate()}>
-          {record.isPending ? "Firmando…" : "Firmar y confirmar swap"}
-        </button>
-        <button type="button" className={`${btnGhost} w-full`} onClick={() => setReview(false)}>Volver a editar</button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      <div>
-        <label htmlFor="swap-net" className={labelCls}>Red</label>
-        <select id="swap-net" className={inputCls} value={network} onChange={(e) => {
-          setNetwork(e.target.value);
-          const opts = assetsForNetwork(networks.find((n) => n.id === e.target.value));
-          setFrom(opts[0] ?? "GTQ"); setToAsset(opts[1] ?? "USDC");
-        }}>
-          {networks.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}
-        </select>
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label htmlFor="swap-from" className={labelCls}>Entrega</label>
-          <select id="swap-from" className={inputCls} value={from} onChange={(e) => setFrom(e.target.value)}>
-            {options.map((a) => <option key={a} value={a}>{a}</option>)}
-          </select>
-        </div>
-        <div>
-          <label htmlFor="swap-to" className={labelCls}>Recibe</label>
-          <select id="swap-to" className={inputCls} value={toAsset} onChange={(e) => setToAsset(e.target.value)}>
-            {options.map((a) => <option key={a} value={a}>{a}</option>)}
-          </select>
-        </div>
-      </div>
-      <div>
-        <label htmlFor="swap-amount" className={labelCls}>Cantidad a cambiar</label>
-        <input id="swap-amount" {...FIELDS.recordUserTransaction.amount} inputMode="decimal" className={inputCls} value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" />
-        <p className="mt-1 text-xs text-[var(--dim)]">Saldo: <span className="tnum">{ledgerOf(user, network, from) ?? "0"} {from}</span></p>
-      </div>
-      <div>
-        <label htmlFor="swap-receive" className={labelCls}>Cantidad que recibe</label>
-        <input id="swap-receive" {...FIELDS.recordUserTransaction.receiveAmount} inputMode="decimal" className={inputCls} value={receiveValue}
-          onChange={(e) => setReceive(e.target.value)} readOnly={autoReceive != null} placeholder="0.00" />
-        <p className="mt-1 text-xs text-[var(--dim)]">
-          {autoReceive != null ? "Estimado con precios de mercado en USD." : "Sin precio público de GTQ: escribe la cantidad acordada."}
-        </p>
-      </div>
-      <p className="text-sm text-[var(--dim)]">Comisión de swap: <span className="font-semibold text-[var(--gold)]">0.1% fijo del monto, cobrado en GTQ</span>{feeEstimate != null && amtNum > 0 ? <> ≈ <span className="tnum font-semibold text-[var(--gold)]">{feeLabel}</span></> : null}</p>
-      {gasUsdS != null && gasUsdS < 0.5 && (
-        <p className="text-sm text-[var(--danger)]">Gas insuficiente: se requieren al menos $0.50 USD en {net?.native} en su dirección para operar en {net?.name} (ahora ≈ {fmtUsd(gasUsdS)}).</p>
-      )}
+      <p className="text-sm text-[var(--dim)]">El gas de la red lo cubre Crossmint (paymaster de las Smart Wallets): no necesitas SOL para el gas.</p>
       {error && <p role="alert" className="text-sm text-[var(--danger)]">{error}</p>}
       <button type="button" className={btnPrimary} onClick={startReview}>Revisar y firmar</button>
     </div>
@@ -927,13 +720,12 @@ function GtqChargePanel({ user }: { user: CustUser }) {
 // is picked HERE — only for sending or receiving (NC Wallet style).
 // ---------------------------------------------------------------------------
 
-function CoinDetail({ user, coin, onBack, onSend, onReceive, onSwap }: {
+function CoinDetail({ user, coin, onBack, onSend, onReceive }: {
   user: CustUser;
   coin: AggCoin;
   onBack: () => void;
   onSend: (network: string, asset: string) => void;
   onReceive: (network: string) => void;
-  onSwap: (network: string, asset: string) => void;
 }) {
   const multi = coin.networks.length > 1;
   const onlyNet = coin.networks[0]?.network ?? "solana";
@@ -949,10 +741,9 @@ function CoinDetail({ user, coin, onBack, onSend, onReceive, onSwap }: {
         </p>
         {multi && <p className="mt-1 text-xs text-[var(--dim)]">Saldo total en {coin.networks.length} redes. Elige la red solo al enviar o recibir.</p>}
         {!multi && (
-          <div className="mt-4 grid grid-cols-3 gap-2">
+          <div className="mt-4 grid grid-cols-2 gap-2">
             <button type="button" className="rounded-xl bg-[var(--accent)] px-3 py-2.5 font-display text-sm font-bold text-black" onClick={() => onSend(onlyNet, coin.asset)}>Enviar</button>
             <button type="button" className={btnGhost} onClick={() => onReceive(onlyNet)}>Recibir</button>
-            <button type="button" className={btnGhost} onClick={() => onSwap(onlyNet, coin.asset)}>Swap</button>
           </div>
         )}
       </div>
@@ -973,10 +764,9 @@ function CoinDetail({ user, coin, onBack, onSend, onReceive, onSwap }: {
                     </div>
                     <p className="tnum shrink-0 font-semibold">{n.balance} {coin.asset}</p>
                   </div>
-                  <div className="mt-2 grid grid-cols-3 gap-2">
+                  <div className="mt-2 grid grid-cols-2 gap-2">
                     <button type="button" aria-label={`Enviar ${coin.asset} por ${n.networkName}`} className="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-bold text-black" onClick={() => onSend(n.network, coin.asset)}>Enviar</button>
                     <button type="button" aria-label={`Recibir ${coin.asset} por ${n.networkName}`} className={btnGhost} onClick={() => onReceive(n.network)}>Recibir</button>
-                    <button type="button" aria-label={`Swap de ${coin.asset} en ${n.networkName}`} className={btnGhost} onClick={() => onSwap(n.network, coin.asset)}>Swap</button>
                   </div>
                 </li>
               );
@@ -1008,7 +798,8 @@ function InternalTransferForm({ fromUser, fee, onDone }: {
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
-  const balance = ledgerOf(fromUser, network, asset);
+  const balancesQ = useQuery({ queryKey: ["userBalances", fromUser.id], queryFn: () => api.getUserBalances({ userId: fromUser.id, sessionToken: tok() }) });
+  const balance = balanceOf(balancesQ.data?.assets, network, asset);
 
   const transfer = useMutation({
     mutationFn: async () => api.internalTransfer({
@@ -1017,6 +808,7 @@ function InternalTransferForm({ fromUser, fee, onDone }: {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["users"] });
       queryClient.invalidateQueries({ queryKey: ["transactions"] });
+      queryClient.invalidateQueries({ queryKey: ["userBalances", fromUser.id] });
       onDone();
     },
     onError: (e) => setError(e instanceof Error ? e.message : "No se pudo hacer la transferencia."),
@@ -1039,7 +831,7 @@ function InternalTransferForm({ fromUser, fee, onDone }: {
   return (
     <form onSubmit={submit} className="space-y-4">
       <p className="text-sm text-[var(--dim)]">
-        Instantánea, solo entre cuentas de la app. Comisión al remitente: <span className="tnum font-semibold text-[var(--gold)]">{fee} GTQ</span>.
+        Se ejecuta en Crossmint, de tu wallet a la wallet del otro usuario. Comisión al remitente: <span className="tnum font-semibold text-[var(--gold)]">{fee} GTQ</span>.
       </p>
       <div>
         <label htmlFor="it-to" className={labelCls}>Usuario destino</label>
@@ -1072,7 +864,7 @@ function InternalTransferForm({ fromUser, fee, onDone }: {
       </div>
       {error && <p role="alert" className="text-sm text-[var(--danger)]">{error}</p>}
       <button type="submit" className={btnPrimary} disabled={transfer.isPending}>
-        {transfer.isPending ? "Transfiriendo…" : "Transferir al instante"}
+        {transfer.isPending ? "Transfiriendo en Crossmint…" : "Transferir con Crossmint"}
       </button>
     </form>
   );
@@ -1194,31 +986,6 @@ function TxList({ txs, networks, users }: { txs: Tx[]; networks: Network[]; user
   );
 }
 
-function LedgerList({ entries, networks, users }: { entries: LedgerEntry[]; networks: Network[]; users: { id: number; name: string }[] }) {
-  if (entries.length === 0) return <p className="text-sm text-[var(--dim)]">Este usuario todavía no tiene movimientos en su libro.</p>;
-  const nameOf = (id: number | null) => (id == null ? null : users.find((u) => u.id === id)?.name ?? `Usuario #${id}`);
-  return (
-    <ul className="space-y-2">
-      {entries.map((e) => (
-        <li key={e.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5">
-          <CoinLogo asset={e.asset} size={28} />
-          <div className="min-w-0 flex-1">
-            <p className="text-sm font-medium">{kindLabel(e.kind)} · {networks.find((n) => n.id === e.network)?.name ?? e.network}</p>
-            <p className="truncate text-xs text-[var(--dim)]">
-              {new Date(e.createdAt).toLocaleString()}
-              {nameOf(e.relatedUserId) ? ` · con ${nameOf(e.relatedUserId)}` : ""}
-              {e.note ? ` · ${e.note}` : ""}
-            </p>
-          </div>
-          <p className={`tnum shrink-0 text-sm font-semibold ${Number(e.amount) < 0 ? "text-[var(--danger)]" : "text-[var(--accent-text)]"}`}>
-            {Number(e.amount) > 0 ? "+" : ""}{e.amount} {e.asset}
-          </p>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Profile: email, phone, KYC, monthly limits, verified-badge authority
 // ---------------------------------------------------------------------------
@@ -1321,12 +1088,12 @@ function ProfilePanel({ user, users }: { user: CustUser; users: CustUser[] }) {
         {user.kycStatus === "verified" ? (
           <p className="mt-1 text-sm text-[var(--dim)]">
             Esta cuenta tiene la <strong className="text-[var(--gold)]">insignia de verificado</strong>, otorgada por {KYC_AUTHORITY}.
-            Su límite mensual es de <strong className="text-[var(--text)]">1,000,000 GTQ</strong> en depósitos y en retiros.
+            Su límite mensual de retiros (envíos) es de <strong className="text-[var(--text)]">1,000,000 GTQ</strong>.
           </p>
         ) : (
           <>
             <p className="mt-1 text-sm text-[var(--dim)]">
-              Límite sin KYC: <strong className="text-[var(--text)]">10,000 GTQ/mes</strong>. Con KYC: <strong className="text-[var(--text)]">1,000,000 GTQ/mes</strong>, en depósitos y retiros.
+              Límite de retiros (envíos) sin KYC: <strong className="text-[var(--text)]">10,000 GTQ/mes</strong>. Con KYC: <strong className="text-[var(--text)]">1,000,000 GTQ/mes</strong>.
             </p>
             <div className="mt-3 flex flex-col gap-2">
               <a href={mailto} className="rounded-xl bg-[var(--accent)] px-4 py-3 text-center font-display text-base font-bold text-black">
@@ -1344,9 +1111,8 @@ function ProfilePanel({ user, users }: { user: CustUser; users: CustUser[] }) {
             <p className="text-sm text-[var(--dim)]">Calculando uso del mes…</p>
           ) : usage ? (
             <>
-              <LimitBar label="Depósitos del mes" used={usage.depositsGtq} limit={limit} />
               <LimitBar label="Retiros (envíos) del mes" used={usage.withdrawalsGtq} limit={limit} />
-              <p className="text-xs text-[var(--dim)]">Las demás monedas cuentan por su valor en USD. El servidor rechaza lo que pase el límite.</p>
+              <p className="text-xs text-[var(--dim)]">Cuenta solo lo enviado y ejecutado en Crossmint este mes. Las demás monedas cuentan por su valor en USD. El servidor rechaza lo que pase el límite.</p>
             </>
           ) : (
             <p className="text-sm text-[var(--dim)]">No se pudo calcular el uso del mes.</p>
@@ -1417,15 +1183,14 @@ const TAB_ICONS: Record<Tab, ReactNode> = {
 export function App() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<Tab>("home");
-  const [homeView, setHomeView] = useState<"saldos" | "agregar" | "detalle">("saldos");
+  const [homeView, setHomeView] = useState<"saldos" | "detalle">("saldos");
   const [detailAsset, setDetailAsset] = useState<string | null>(null);
   const [flowNetwork, setFlowNetwork] = useState("solana");
   const [flowAsset, setFlowAsset] = useState("GTQ");
   const [flowKey, setFlowKey] = useState(0);
   const [lastAutoSync, setLastAutoSync] = useState("");
-  const [histView, setHistView] = useState<"ops" | "libro">("ops");
   const [perfilView, setPerfilView] = useState<"menu" | "perfil" | "usuarios" | "ajustes" | "contactos" | "password">("menu");
-  const [sendMode, setSendMode] = useState<"enviar" | "swap" | "transferir">("enviar");
+  const [sendMode, setSendMode] = useState<"enviar" | "transferir">("enviar");
   const [receiveMode, setReceiveMode] = useState<"recibir" | "qr">("recibir");
   const [justDone, setJustDone] = useState(false);
   const [token, setToken] = useState<string | null>(() => getSessionToken());
@@ -1483,41 +1248,20 @@ export function App() {
     enabled: selected != null,
     refetchInterval: 30000,
   });
-  const ledgerQ = useQuery({
-    queryKey: ["ledger", selected?.id],
-    queryFn: () => api.listLedgerEntries({ userId: selected!.id, limit: 50, sessionToken: tok() }),
-    enabled: selected != null,
-    refetchInterval: 30000,
-  });
-
-  const sync = useMutation({
-    mutationFn: async () => api.syncUserDeposits({ userId: selected!.id, sessionToken: tok() }),
-    onSuccess: (d) => {
-      queryClient.invalidateQueries({ queryKey: ["users"] });
-      queryClient.invalidateQueries({ queryKey: ["transactions"] });
-      queryClient.invalidateQueries({ queryKey: ["ledger", selected?.id] });
-      balancesQ.refetch();
-      setSyncMsg(d.credited.length === 0
-        ? "Sin depósitos nuevos en cadena para este usuario."
-        : "Depósitos acreditados: " + d.credited.map((c) => `${c.amount} ${c.asset} (${c.network})`).join(", "));
-    },
-    onError: (e) => setSyncMsg(e instanceof Error ? e.message : "No se pudo sincronizar."),
-  });
-
-  // Automatic deposit sync, NC Wallet style: runs when the app opens, when
-  // the active user changes, and every 60 s while the app is open. The user
-  // never has to press a sync button for deposits to appear.
+  // Automatic Crossmint provisioning, NC Wallet style: runs when the app
+  // opens, when the active user changes, and every 60 s while the app is
+  // open — any user who still lacks a Crossmint wallet gets it created
+  // automatically. Balances need no sync: they are read live from Crossmint.
   const autoSync = useMutation({
     mutationFn: async () => api.syncAllDeposits({}),
     onSuccess: (d) => {
       setLastAutoSync(d.fetchedAt);
-      if (d.credited.length > 0) {
+      if (d.walletsCreated.length > 0) {
         queryClient.invalidateQueries({ queryKey: ["users"] });
-        queryClient.invalidateQueries({ queryKey: ["transactions"] });
-        queryClient.invalidateQueries({ queryKey: ["ledger"] });
-        const mine = d.credited.filter((c) => c.userId === selected?.id);
+        queryClient.invalidateQueries({ queryKey: ["session"] });
+        const mine = d.walletsCreated.filter((c) => c.userId === selected?.id);
         if (mine.length > 0) {
-          setSyncMsg("Depósito acreditado automáticamente: " + mine.map((c) => `${c.amount} ${c.asset} (${c.network})`).join(", "));
+          setSyncMsg("Tu wallet de Crossmint se creó automáticamente: " + mine.map((c) => c.address).join(", "));
         }
       }
     },
@@ -1565,8 +1309,7 @@ export function App() {
   useEffect(() => { setDetailAsset(null); setHomeView("saldos"); }, [selected?.id]);
   useEffect(() => { if (tab !== "home") { setDetailAsset(null); setHomeView("saldos"); } }, [tab ]);
 
-  const totalGtqLedger = (selected?.ledger ?? []).filter((l) => l.asset === "GTQ")
-    .reduce((sum, l) => sum + (Number(l.balance) || 0), 0);
+  const totalGtq = aggregated.find((a) => a.asset === "GTQ")?.total ?? 0;
   const loading = networksQ.isPending || (token != null && sessionQ.isPending);
 
   // Session gate: without a valid session the only screen is access
@@ -1593,10 +1336,10 @@ export function App() {
             <div className="min-w-0">
               <p className="truncate text-xs text-[var(--dim)]">Quetzal Wallet</p>
               <p className="font-display text-3xl font-extrabold">
-                <span className="tnum">{totalGtqLedger.toLocaleString("en-US", { maximumFractionDigits: 6 })}</span>{" "}
+                <span className="tnum">{totalGtq.toLocaleString("en-US", { maximumFractionDigits: 6 })}</span>{" "}
                 <span className="text-[var(--accent-text)]">GTQ</span>
               </p>
-              <p className="text-xs text-[var(--dim)]">Saldo total · Solana</p>
+              <p className="text-xs text-[var(--dim)]">Saldo en Crossmint · Solana</p>
             </div>
             <div className="flex shrink-0 flex-col items-end gap-1.5">
               <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[var(--accent)] font-display text-lg font-extrabold text-black">Q</span>
@@ -1626,19 +1369,13 @@ export function App() {
           {loading ? (
             <p className="py-10 text-center text-sm text-[var(--dim)]">Cargando tu wallet…</p>
           ) : tab === "home" ? (
-            homeView === "agregar" ? (
-              <div className="space-y-4">
-                <button type="button" className={btnGhost} onClick={() => setHomeView("saldos")}>← Volver a saldos</button>
-                <CreditDepositForm user={selected!} networks={networks} />
-              </div>
-            ) : homeView === "detalle" && detailCoin ? (
+            homeView === "detalle" && detailCoin ? (
               <CoinDetail
                 user={selected!}
                 coin={detailCoin}
                 onBack={() => { setHomeView("saldos"); setDetailAsset(null); }}
                 onSend={(netId, ast) => { setFlowNetwork(netId); setFlowAsset(ast); setFlowKey((k) => k + 1); setSendMode("enviar"); setJustDone(false); setTab("enviar"); }}
                 onReceive={(netId) => { setFlowNetwork(netId); setFlowKey((k) => k + 1); setReceiveMode("recibir"); setTab("recibir"); }}
-                onSwap={(netId, ast) => { setFlowNetwork(netId); setFlowAsset(ast); setFlowKey((k) => k + 1); setSendMode("swap"); setJustDone(false); setTab("enviar"); }}
               />
             ) : (
             <div className="space-y-4">
@@ -1648,7 +1385,7 @@ export function App() {
                   <p className="tnum font-display text-3xl font-extrabold">{totalUsdAll != null ? fmtUsd(totalUsdAll) : "—"}</p>
                 </div>
                 <p className="text-right text-xs text-[var(--dim)]">
-                  {autoSync.isPending || sync.isPending ? "Sincronizando depósitos…" : lastAutoSync ? <>Depósitos al día · {new Date(lastAutoSync).toLocaleTimeString()}</> : "Sincronización automática activa"}
+                  {autoSync.isPending ? "Conectando con Crossmint…" : lastAutoSync ? <>Saldos desde Crossmint · {new Date(lastAutoSync).toLocaleTimeString()}</> : "Saldos desde Crossmint"}
                 </p>
               </div>
               {syncMsg && <p className="text-sm text-[var(--accent-text)]" role="status">{syncMsg}</p>}
@@ -1658,18 +1395,13 @@ export function App() {
               <div className="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)]">
                 <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-2.5">
                   <p className="text-sm font-semibold">Tus monedas</p>
-                  {isOperator && (
-                    <button type="button" className="text-sm font-medium text-[var(--accent-text)]" onClick={() => setHomeView("agregar")}>+ Agregar</button>
-                  )}
+                  <p className="text-xs text-[var(--dim)]">Wallet de Crossmint</p>
                 </div>
                 {balancesQ.isPending ? (
-                  <p className="px-4 py-6 text-sm text-[var(--dim)]">Leyendo saldos…</p>
+                  <p className="px-4 py-6 text-sm text-[var(--dim)]">Leyendo saldos de Crossmint…</p>
                 ) : (
                   <ul>
-                    {aggregated.map((c) => {
-                      const ledgerTotal = selected!.ledger.filter((l) => l.asset === c.asset)
-                        .reduce((s, l) => s + (Number(l.balance) || 0), 0);
-                      return (
+                    {aggregated.map((c) => (
                         <li key={c.asset} className="border-b border-[var(--border)] last:border-b-0">
                           <button type="button" aria-label={`Ver ${c.asset}: saldo total, redes y opciones de enviar o recibir`}
                             className="flex w-full items-center gap-3 px-4 py-3 text-left"
@@ -1679,7 +1411,6 @@ export function App() {
                               <span className="block font-medium">{c.asset} <span className="text-sm font-normal text-[var(--dim)]">· {COIN_NAMES[c.asset] ?? ""}</span></span>
                               <span className="block text-xs text-[var(--dim)]">
                                 {c.networks.length > 1 ? `En ${c.networks.length} redes` : c.networks[0]?.networkName ?? ""}
-                                {ledgerTotal !== 0 ? ` · En tu cuenta: ${fmtTotal(ledgerTotal)}` : ""}
                               </span>
                             </span>
                             <span className="shrink-0 text-right">
@@ -1689,8 +1420,7 @@ export function App() {
                             <span aria-hidden="true" className="shrink-0 text-lg text-[var(--dim)]">›</span>
                           </button>
                         </li>
-                      );
-                    })}
+                    ))}
                   </ul>
                 )}
               </div>
@@ -1758,11 +1488,6 @@ export function App() {
                         {expandedUser === u.id ? "Ocultar" : "Direcciones"}
                       </button>
                     </div>
-                    {u.ledger.length > 0 && (
-                      <p className="mt-2 text-sm text-[var(--dim)]">
-                        Saldos: {u.ledger.map((l) => `${l.balance} ${l.asset} (${l.network})`).join(" · ")}
-                      </p>
-                    )}
                     {expandedUser === u.id && (
                       <ul className="mt-3 space-y-2">
                         {u.crossmintAddress && (
@@ -1797,7 +1522,7 @@ export function App() {
           ) : tab === "enviar" ? (
             <div className="space-y-4">
               <div className={segWrap} role="group" aria-label="Tipo de operación de envío">
-                {([["enviar", "Enviar"], ["swap", "Swap"], ["transferir", "Entre usuarios"]] as const).map(([m, label]) => (
+                {([["enviar", "Enviar"], ["transferir", "Entre usuarios"]] as const).map(([m, label]) => (
                   <button key={m} type="button" aria-pressed={sendMode === m} onClick={() => { setSendMode(m); setJustDone(false); }}
                     className={segCls(sendMode === m)}>
                     {label}
@@ -1806,14 +1531,12 @@ export function App() {
               </div>
               {justDone ? (
                 <div className="space-y-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 text-center">
-                  <p className="font-display text-lg font-bold">Operación firmada y registrada</p>
-                  <p className="text-sm text-[var(--dim)]">Se liquidó en la cuenta de {selected!.name}.</p>
+                  <p className="font-display text-lg font-bold">Operación ejecutada en Crossmint</p>
+                  <p className="text-sm text-[var(--dim)]">Crossmint la firmó y la envió a la red Solana desde la wallet de {selected!.name}. Revisa su estado en el historial.</p>
                   <button type="button" className={btnPrimary} onClick={() => { setJustDone(false); setTab("historial"); }}>Ver historial</button>
                 </div>
               ) : sendMode === "enviar" ? (
                 <SendForm key={`send-${flowKey}`} user={selected!} networks={networks} fee={fee} onDone={() => setJustDone(true)} initialNetwork={flowNetwork} initialAsset={flowAsset} />
-              ) : sendMode === "swap" ? (
-                <SwapForm key={`swap-${flowKey}`} user={selected!} networks={networks} onDone={() => setJustDone(true)} initialNetwork={flowNetwork} initialAsset={flowAsset} />
               ) : (
                 <InternalTransferForm fromUser={selected!} fee={fee} onDone={() => setJustDone(true)} />
               )}
@@ -1834,18 +1557,7 @@ export function App() {
             </div>
           ) : tab === "historial" ? (
             <div className="space-y-4">
-              <div className={segWrap} role="group" aria-label="Tipo de historial">
-                {([["ops", "Operaciones"], ["libro", "Libro"]] as const).map(([v, label]) => (
-                  <button key={v} type="button" aria-pressed={histView === v} onClick={() => setHistView(v)} className={segCls(histView === v)}>
-                    {label}
-                  </button>
-                ))}
-              </div>
-              {histView === "ops" ? (
-                <TxList txs={txQ.data?.transactions ?? []} networks={networks} users={directory} />
-              ) : (
-                <LedgerList entries={ledgerQ.data?.entries ?? []} networks={networks} users={directory} />
-              )}
+              <TxList txs={txQ.data?.transactions ?? []} networks={networks} users={directory} />
             </div>
           ) : (
             <ProfilePanel user={selected!} users={users} />

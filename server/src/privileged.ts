@@ -2,12 +2,16 @@ import { definePrivilegedContracts, definePrivilegedHandlers, z } from "@hatch/s
 import {
   encryptText, decryptText, generateServerSecret, type EncryptedText,
   hashSecret, verifySecret, generateSessionToken, hashToken, generateRecoveryCode,
+  signApprovalMessage,
 } from "./crypto";
 
-// Only two privileged operations remain: encrypting/decrypting the
-// operator's Crossmint API key at rest, and generating the server secret it
-// is encrypted with. There is deliberately NO seed-phrase contract here:
-// this wallet never generates, imports, recovers or derives from a mnemonic.
+// Privileged operations: encrypting/decrypting the operator's Crossmint API
+// key at rest, generating the server secret it is encrypted with, password
+// hashing / session tokens / recovery codes, and signing Crossmint
+// transaction approvals with the operator's server signer (whose secret
+// lives only in the operator's own file on this server and is never
+// returned). There is deliberately NO seed-phrase contract here: this
+// wallet never generates, imports, recovers or derives from a mnemonic.
 export const privileged = definePrivilegedContracts({
   encryptText: {
     request: z.object({ text: z.string().min(1).max(500), passphrase: z.string().min(1).max(200) }),
@@ -54,6 +58,15 @@ export const privileged = definePrivilegedContracts({
     response: z.object({ code: z.string() }),
     timeoutMs: 30000,
   },
+  // Signs ONE Crossmint transaction-approval message with the operator's
+  // server signer (Ed25519). The signer secret is read from the operator's
+  // own file inside this handler and never leaves it: the response carries
+  // only the signature and the signer's PUBLIC address.
+  signApprovalMessage: {
+    request: z.object({ message: z.string().min(1).max(4096) }),
+    response: z.object({ signature: z.string(), signerAddress: z.string() }),
+    timeoutMs: 30000,
+  },
 });
 
 export const privilegedHandlers = definePrivilegedHandlers(privileged, {
@@ -85,5 +98,8 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
   },
   generateRecoveryCode() {
     return { code: generateRecoveryCode() };
+  },
+  signApprovalMessage(args) {
+    return signApprovalMessage(args.message);
   },
 });
